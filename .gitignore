@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Numpy / artifacts
+*.npy
+
+# ONNX large artifacts (keep only if explicitly needed)
+*.onnx
+*.pb
+
+# Audio test data
+*.wav
+*.mp3
+*.flac
+calib_wavs/
+
+# Logs / debug
+*.log
+debug/
+tmp/
+temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Shell leftovers
+*.sh~
+*.bak
+
+# Model backups
+*.backup.onnx
+*.raw.onnx
+
+# Misc experiments
+qq.py
+qua.py
+que.py
+qui.py
+qu.py
