@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# fix_opset.py
 import onnx
 import sys
 
@@ -11,13 +12,11 @@ out = sys.argv[2]
 
 model = onnx.load(inp)
 
-# Collect unique opsets by domain
 unique = {}
 for oi in model.opset_import:
-    domain = oi.domain or ""   # normalize None → ""
+    domain = oi.domain or ""
     unique[domain] = oi.version
 
-# Clear and reinsert clean opset list
 del model.opset_import[:]
 
 for domain, version in unique.items():
