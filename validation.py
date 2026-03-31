@@ -1,14 +1,22 @@
 # @path: validation.py
+
 import sys
 import numpy as np
-import librosa
 import onnxruntime as ort
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
 
 AUDIO_PATH = "test.wav"
 
@@ -20,33 +28,16 @@ EMB_MEAN = "emb_mean.npy"
 EMB_STD = "emb_std.npy"
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db = mel_db.T.astype(np.float32)
-
-    T = mel_db.shape[0]
-
-    if T >= FRAMES:
-        mel_db = mel_db[:FRAMES, :]
-    else:
-        pad_rows = FRAMES - T
-        pad_value = mel_db.min() if T > 0 else -80.0
-        mel_db = np.vstack([
-            mel_db,
-            np.full((pad_rows, N_MELS), pad_value, dtype=np.float32)
-        ])
-
-    return mel_db
 
 def python_pipeline(mel):
     enc_sess = ort.InferenceSession(ENCODER, providers=["CPUExecutionProvider"])
@@ -54,37 +45,53 @@ def python_pipeline(mel):
 
     enc_input = enc_sess.get_inputs()[0].name
     head_input = head_sess.get_inputs()[0].name
+    enc_shape = enc_sess.get_inputs()[0].shape
+    head_shape = head_sess.get_inputs()[0].shape
+
+    enc_inp = prepare_input_for_model(
+        mel,
+        enc_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     emb = enc_sess.run(
         None,
-        {enc_input: mel[np.newaxis, :, :]}
+        {enc_input: enc_inp.astype(np.float32)}
     )[0]
 
     emb_mean = np.load(EMB_MEAN)
     emb_std = np.load(EMB_STD)
-    emb_std = np.where(emb_std < 1e-8, 1.0, emb_std)
+    emb_std = np.asarray(emb_std, dtype=np.float32)
 
-    emb_stdized = (emb - emb_mean) / emb_std
+    emb_stdized = standardize_embedding(emb, emb_mean, emb_std)
+    head_inp = prepare_vector_for_model(emb_stdized, head_shape)
 
     raw = head_sess.run(
         None,
-        {head_input: emb_stdized.astype(np.float32)}
+        {head_input: head_inp.astype(np.float32)}
     )[0][0]
 
-    final = np.tanh(raw)
-
-    return final
+    return np.asarray(raw, dtype=np.float32).reshape(-1)
 
 def merged_pipeline(mel):
     sess = ort.InferenceSession(MERGED, providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
+    input_shape = sess.get_inputs()[0].shape
+
+    inp = prepare_input_for_model(
+        mel,
+        input_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     out = sess.run(
         None,
-        {input_name: mel[np.newaxis, :, :]}
+        {input_name: inp.astype(np.float32)}
     )[0][0]
 
-    return out
+    return np.asarray(out, dtype=np.float32).reshape(-1)
 
 if __name__ == "__main__":
     mel = make_mel(AUDIO_PATH)
@@ -107,6 +114,6 @@ if __name__ == "__main__":
         print(f"ERROR: expected merged output shape (2,), got {merged_out.shape}", file=sys.stderr)
         sys.exit(2)
 
-    if diff.max() >= 1e-3:
+    if diff.max() >= 1e-4:
         print(f"ERROR: parity check failed, max diff={diff.max():.6e}", file=sys.stderr)
         sys.exit(3)

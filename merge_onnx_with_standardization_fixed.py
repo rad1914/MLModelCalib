@@ -1,4 +1,5 @@
 # @path: merge_onnx_with_standardization_fixed.py
+
 import sys
 import onnx
 from onnx import TensorProto
@@ -19,15 +20,11 @@ def main():
         raise RuntimeError(f"Encoder must have exactly 1 output, got {len(enc.graph.output)}")
     if len(head.graph.input) != 1:
         raise RuntimeError(f"Head must have exactly 1 input, got {len(head.graph.input)}")
-    if len(head.graph.output) < 1:
-        raise RuntimeError("Head must have at least 1 output")
+    if len(head.graph.output) != 1:
+        raise RuntimeError(f"Head must have exactly 1 output, got {len(head.graph.output)}")
 
     enc_out = enc.graph.output[0].name
     head_in  = head.graph.input[0].name
-
-    print("DEBUG:")
-    print(" encoder_out:", enc_out)
-    print(" head_input :", head_in)
 
     mean = np.load(mean_path).astype(np.float32)
     std  = np.load(std_path).astype(np.float32)
@@ -59,9 +56,6 @@ def main():
     div_node = helper.make_node("Div", [sub_out, "std_std_const"],  [div_out], name="std_div")
     merged.graph.node.extend([sub_node, div_node])
 
-    print("DEBUG:")
-    print(" standardization:", enc_out, "->", sub_out, "->", div_out)
-
     prefix = "head_"
     all_names = set()
 
@@ -82,7 +76,11 @@ def main():
     def map_name(n):
         return name_map.get(n, n)
 
-    if head_in not in [n for node in head.graph.node for n in list(node.input) + list(node.output)]:
+    head_internal = set()
+    for node in head.graph.node:
+        head_internal.update(node.input)
+        head_internal.update(node.output)
+    if head_in not in head_internal:
         raise RuntimeError(f"Head input '{head_in}' not found in head graph")
     
     for init in head.graph.initializer:
@@ -103,11 +101,17 @@ def main():
             new_node.attribute.extend([attr])
         merged.graph.node.append(new_node)
 
-    print("DEBUG:")
-    print(" last 5 nodes:", [n.op_type for n in merged.graph.node[-5:]])
-
-    if merged.graph.node[-1].op_type in {"Sub", "Div"}:
-        raise RuntimeError("Graph terminated at standardization (head not connected)")
+    sub_nodes = [n for n in merged.graph.node if n.op_type == "Sub" and len(n.output) == 1 and n.output[0] == sub_out]
+    div_nodes = [n for n in merged.graph.node if n.op_type == "Div" and len(n.output) == 1 and n.output[0] == div_out]
+    if not sub_nodes or not div_nodes:
+        raise RuntimeError("Failed to insert standardization nodes")
+    if enc_out not in sub_nodes[0].input:
+        raise RuntimeError("Encoder output is not feeding the Sub node")
+    if sub_out not in div_nodes[0].input:
+        raise RuntimeError("Sub output is not feeding the Div node")
+    head_consumers = [n for n in merged.graph.node if n.name.startswith(prefix) and div_out in n.input]
+    if not head_consumers:
+        raise RuntimeError("Standardized embedding does not reach the head")
 
     for vi in head.graph.value_info:
         new_vi = onnx.ValueInfoProto()
@@ -122,11 +126,19 @@ def main():
         new_o.name = map_name(o.name)
         merged.graph.output.append(new_o)
 
-    print("DEBUG:")
-    print(" final outputs:", [o.name for o in merged.graph.output])
-
     if len(merged.graph.output) != len(head.graph.output):
         raise RuntimeError("Failed to propagate head outputs into merged graph")
+
+    def _dims(vi):
+        return [
+            d.dim_value if d.HasField("dim_value") else None
+            for d in vi.type.tensor_type.shape.dim
+        ]
+
+    out_dims = _dims(merged.graph.output[0])
+    known_out_dims = [d for d in out_dims if d is not None]
+    if known_out_dims and 2 not in known_out_dims:
+        raise RuntimeError(f"Head output does not look like a 2-value VA tensor: {out_dims}")
 
     try:
         inferred = onnx.shape_inference.infer_shapes(merged)

@@ -1,23 +1,155 @@
-# @path: compute_calib_stats.py
-
+# @path: audio_utils.py
 from __future__ import annotations
-import os
-import sys
-import argparse
-import numpy as np
+
+from typing import Sequence
+
 import librosa
-import onnxruntime as ort
-from typing import Tuple, List
+import numpy as np
 
 DEFAULT_SR = 16000
 DEFAULT_N_FFT = 512
 DEFAULT_HOP = 256
 DEFAULT_N_MELS = 96
 DEFAULT_FRAMES = 187
-DEFAULT_WIN_SEC = 3.0
-DEFAULT_HOP_SEC = 1.0
-EPS_STD_FLOOR = 1e-6
+DEFAULT_POWER = 2.0
+DEFAULT_CLIP_MIN = -80.0
+DEFAULT_CLIP_MAX = 0.0
 STD_FLOOR = 1e-6
+
+def _dim_to_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+def load_audio(path: str, sr: int = DEFAULT_SR) -> np.ndarray:
+    y, _ = librosa.load(path, sr=sr, mono=True)
+    return np.asarray(y, dtype=np.float32)
+
+def make_mel_patch(
+    y: np.ndarray,
+    sr: int = DEFAULT_SR,
+    n_fft: int = DEFAULT_N_FFT,
+    hop: int = DEFAULT_HOP,
+    n_mels: int = DEFAULT_N_MELS,
+    frames: int = DEFAULT_FRAMES,
+    power: float = DEFAULT_POWER,
+    clip_min: float = DEFAULT_CLIP_MIN,
+    clip_max: float = DEFAULT_CLIP_MAX,
+) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop,
+        n_mels=n_mels,
+        power=power,
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    mel_db = np.clip(mel_db, clip_min, clip_max).T.astype(np.float32)
+
+    if mel_db.shape[0] >= frames:
+        return mel_db[:frames]
+
+    pad_rows = frames - mel_db.shape[0]
+    pad_value = float(mel_db.min()) if mel_db.size else clip_min
+    return np.vstack(
+        [mel_db, np.full((pad_rows, n_mels), pad_value, dtype=np.float32)]
+    )
+
+def prepare_input_for_model(
+    patch: np.ndarray,
+    model_input_shape: Sequence | None,
+    frames: int = DEFAULT_FRAMES,
+    n_mels: int = DEFAULT_N_MELS,
+) -> np.ndarray:
+    arr = np.asarray(patch, dtype=np.float32)[np.newaxis, :, :]
+
+    if not model_input_shape:
+        return arr
+
+    shape = list(model_input_shape)
+
+    if len(shape) == 3:
+        s1 = _dim_to_int(shape[1])
+        s2 = _dim_to_int(shape[2])
+        if (s1 is None or s1 == frames) and (s2 is None or s2 == n_mels):
+            return arr
+        if (s1 is None or s1 == n_mels) and (s2 is None or s2 == frames):
+            return arr.transpose(0, 2, 1)
+
+    if len(shape) == 4:
+        s1 = _dim_to_int(shape[1])
+        s2 = _dim_to_int(shape[2])
+        s3 = _dim_to_int(shape[3])
+        if (s1 is None or s1 == frames) and (s2 is None or s2 == n_mels):
+            return arr[:, :, :, np.newaxis]
+        if (s2 is None or s2 == frames) and (s3 is None or s3 == n_mels):
+            return arr[:, np.newaxis, :, :]
+        if (s1 is None or s1 == n_mels) and (s2 is None or s2 == frames):
+            return arr.transpose(0, 2, 1)[:, :, :, np.newaxis]
+
+    return arr
+
+def prepare_vector_for_model(
+    vector: np.ndarray,
+    model_input_shape: Sequence | None,
+) -> np.ndarray:
+    vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+
+    if not model_input_shape:
+        return vec[np.newaxis, :]
+
+    shape = list(model_input_shape)
+
+    if len(shape) == 1:
+        return vec
+
+    if len(shape) == 2:
+        s0 = _dim_to_int(shape[0])
+        s1 = _dim_to_int(shape[1])
+        if s1 is None or s1 == vec.size:
+            return vec[np.newaxis, :]
+        if s0 is None or s0 == vec.size:
+            return vec[:, np.newaxis]
+
+    return vec[np.newaxis, :]
+
+def standardize_embedding(
+    emb: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    floor: float = STD_FLOOR,
+) -> np.ndarray:
+    emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+    mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+    std = np.asarray(std, dtype=np.float32).reshape(-1)
+    std_safe = np.maximum(std, floor)
+    return ((emb - mean) / std_safe).astype(np.float32)
+# @path: compute_calib_stats.py
+
+from __future__ import annotations
+import argparse
+import os
+import sys
+from typing import List, Tuple
+
+import numpy as np
+import onnxruntime as ort
+
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    STD_FLOOR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compute embedding mean/std from WAV calibration set")
@@ -30,9 +162,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--hop', type=int, default=DEFAULT_HOP, help='STFT hop_length (samples)')
     p.add_argument('--n-mels', type=int, default=DEFAULT_N_MELS, help='Number of mel bins')
     p.add_argument('--frames', type=int, default=DEFAULT_FRAMES, help='Number of frames (time axis) expected by the model')
-    p.add_argument('--win-sec', type=float, default=DEFAULT_WIN_SEC, help='Window length in seconds (patch size)')
-    p.add_argument('--hop-sec', type=float, default=DEFAULT_HOP_SEC, help='Hop/stride between patches in seconds')
-    p.add_argument('--power', type=float, default=2.0, help='Power for mel spectrogram (2.0 for power)')
+    p.add_argument('--power', type=float, default=DEFAULT_POWER, help='Power for mel spectrogram (2.0 for power)')
     p.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
     return p.parse_args()
 
@@ -40,60 +170,8 @@ def list_wavs(calib_dir: str) -> List[str]:
     files = sorted([f for f in os.listdir(calib_dir) if f.lower().endswith('.wav')])
     return files
 
-def load_audio(path: str, sr: int) -> np.ndarray:
-    y, _ = librosa.load(path, sr=sr, mono=True)
-    return y
-
-def make_mel_patch(y: np.ndarray, sr: int, n_fft: int, hop: int, n_mels: int, frames: int, power: float) -> np.ndarray:
-    y = y.astype(np.float32)
-    mel = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_fft=n_fft, hop_length=hop,
-        n_mels=n_mels, power=power
-    )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db = np.clip(mel_db, -80.0, 0.0)
-
-    frames_raw = mel_db.shape[1]
-    if frames_raw % 2 != 0:
-        mel_db = mel_db[:, :frames_raw - 1]
-
-    mel_ds = 0.5 * (mel_db[:, 0::2] + mel_db[:, 1::2])
-    mel_db = mel_ds.T
-
-    if mel_db.shape[0] >= frames:
-        start = (mel_db.shape[0] - frames)
-        patch = mel_db[start:start+frames].astype(np.float32)
-    else:
-        pad_val = float(mel_db.min()) if mel_db.size else -80.0
-        pad = np.full((frames - mel_db.shape[0], n_mels), pad_val, dtype=np.float32)
-        patch = np.vstack([mel_db.astype(np.float32), pad])
-    return patch
-
 def prepare_input_for_model(patch: np.ndarray, model_input_shape, frames: int, n_mels: int) -> np.ndarray:
-    arr = patch[np.newaxis, :, :].astype(np.float32)
-
-    if not model_input_shape:
-        return arr
-
-    shape = list(model_input_shape)
-    if len(shape) == 3:
-        s1 = shape[1]
-        s2 = shape[2]
-        if (s1 is None or int(s1) == frames) and (s2 is None or int(s2) == n_mels):
-            return arr
-        if (s1 is None or int(s1) == n_mels) and (s2 is None or int(s2) == frames):
-            return arr.transpose(0,2,1)
-
-    if len(shape) == 4:
-        if (shape[1] is None or int(shape[1]) == frames) and (shape[2] is None or int(shape[2]) == n_mels):
-            return arr[:, :, :, np.newaxis]
-        if (shape[2] is None or int(shape[2]) == frames) and (shape[3] is None or int(shape[3]) == n_mels):
-            return arr[:, np.newaxis, :, :]
-        if (shape[1] is None or int(shape[1]) == n_mels) and (shape[2] is None or int(shape[2]) == frames):
-            return arr.transpose(0,2,1)[:, :, :, np.newaxis]
-
-    return arr
+    return prepare_input_for_model(patch, model_input_shape, frames=frames, n_mels=n_mels)
 
 def open_session(model_path: str) -> ort.InferenceSession:
     try:
@@ -102,7 +180,7 @@ def open_session(model_path: str) -> ort.InferenceSession:
         print("Error: Failed to open ONNX model:", e, file=sys.stderr)
         raise
 
-def compute_stats_from_embeddings(emb_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+def compute_stats_from_embeddings(emb_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, int]:
     embs = np.stack(emb_list, axis=0)
     mean = embs.mean(axis=0)
     std = embs.std(axis=0)
@@ -134,8 +212,6 @@ def main():
 
     emb_list = []
     total_patches = 0
-    win_samples = int(args.win_sec * args.sr)
-    hop_samples = int(args.hop_sec * args.sr)
     for i, fname in enumerate(wavs, 1):
         path = os.path.join(args.calib, fname)
         try:
@@ -144,41 +220,38 @@ def main():
             print(f"Warning: failed to load {fname}: {e}", file=sys.stderr)
             continue
 
-        if len(y) < win_samples:
-            starts = [0]
-        else:
-            starts = list(range(0, max(1, len(y) - win_samples + 1), hop_samples))
+        patch = make_mel_patch(
+            y,
+            sr=args.sr,
+            n_fft=args.n_fft,
+            hop=args.hop,
+            n_mels=args.n_mels,
+            frames=args.frames,
+            power=args.power,
+        )
+        inp = prepare_input_for_model(patch, in_shape, frames=args.frames, n_mels=args.n_mels).astype(np.float32)
+        try:
+            out = sess.run(None, {in_name: inp})
+        except Exception as e:
+            print(f"Warning: model inference failed on {fname}: {e}", file=sys.stderr)
+            continue
+        if not out or len(out[0].shape) == 0:
+            print(f"Warning: unexpected encoder output shape for {fname}", file=sys.stderr)
+            continue
+        emb = np.asarray(out[0]).reshape(-1)
 
-        for s in starts:
-            chunk = y[s:s+win_samples]
-            patch = make_mel_patch(chunk, sr=args.sr, n_fft=args.n_fft, hop=args.hop,
-                                   n_mels=args.n_mels, frames=args.frames, power=args.power)
-            inp = prepare_input_for_model(patch, in_shape, frames=args.frames, n_mels=args.n_mels)
-            inp = inp.astype(np.float32)
-            try:
-                out = sess.run(None, {in_name: inp})
-            except Exception as e:
-                print(f"Warning: model inference failed on {fname} (start={s}): {e}", file=sys.stderr)
-                continue
-            if not out or len(out[0].shape) == 0:
-                print(f"Warning: unexpected encoder output shape for {fname}", file=sys.stderr)
-                continue
-            emb = np.asarray(out[0]).reshape(-1)
+        if emb.shape[0] != 200:
+            raise RuntimeError(f"Unexpected embedding dim {emb.shape[0]}")
 
-            if emb.shape[0] != 200:
-                raise RuntimeError(f"Unexpected embedding dim {emb.shape[0]}")
-
-            emb_list.append(emb.astype(np.float32))
-            total_patches += 1
+        emb_list.append(emb.astype(np.float32))
+        total_patches += 1
 
         if args.verbose:
-            print(f"[{i}/{len(wavs)}] {fname}: patches={len(starts)} total_patches={total_patches}")
+            print(f"[{i}/{len(wavs)}] {fname}: patches=1 total_patches={total_patches}")
 
     if not emb_list:
         print("ERROR: No embeddings were produced. Check model input shape and calibration audio.", file=sys.stderr)
         sys.exit(4)
-
-    np.random.shuffle(emb_list)
 
     mean, std, n_samples = compute_stats_from_embeddings(emb_list)
 
@@ -191,6 +264,7 @@ def main():
 if __name__ == '__main__':
     main()
 # @path: merge_onnx_with_standardization_fixed.py
+
 import sys
 import onnx
 from onnx import TensorProto
@@ -211,15 +285,11 @@ def main():
         raise RuntimeError(f"Encoder must have exactly 1 output, got {len(enc.graph.output)}")
     if len(head.graph.input) != 1:
         raise RuntimeError(f"Head must have exactly 1 input, got {len(head.graph.input)}")
-    if len(head.graph.output) < 1:
-        raise RuntimeError("Head must have at least 1 output")
+    if len(head.graph.output) != 1:
+        raise RuntimeError(f"Head must have exactly 1 output, got {len(head.graph.output)}")
 
     enc_out = enc.graph.output[0].name
     head_in  = head.graph.input[0].name
-
-    print("DEBUG:")
-    print(" encoder_out:", enc_out)
-    print(" head_input :", head_in)
 
     mean = np.load(mean_path).astype(np.float32)
     std  = np.load(std_path).astype(np.float32)
@@ -251,9 +321,6 @@ def main():
     div_node = helper.make_node("Div", [sub_out, "std_std_const"],  [div_out], name="std_div")
     merged.graph.node.extend([sub_node, div_node])
 
-    print("DEBUG:")
-    print(" standardization:", enc_out, "->", sub_out, "->", div_out)
-
     prefix = "head_"
     all_names = set()
 
@@ -274,7 +341,11 @@ def main():
     def map_name(n):
         return name_map.get(n, n)
 
-    if head_in not in [n for node in head.graph.node for n in list(node.input) + list(node.output)]:
+    head_internal = set()
+    for node in head.graph.node:
+        head_internal.update(node.input)
+        head_internal.update(node.output)
+    if head_in not in head_internal:
         raise RuntimeError(f"Head input '{head_in}' not found in head graph")
     
     for init in head.graph.initializer:
@@ -295,11 +366,17 @@ def main():
             new_node.attribute.extend([attr])
         merged.graph.node.append(new_node)
 
-    print("DEBUG:")
-    print(" last 5 nodes:", [n.op_type for n in merged.graph.node[-5:]])
-
-    if merged.graph.node[-1].op_type in {"Sub", "Div"}:
-        raise RuntimeError("Graph terminated at standardization (head not connected)")
+    sub_nodes = [n for n in merged.graph.node if n.op_type == "Sub" and len(n.output) == 1 and n.output[0] == sub_out]
+    div_nodes = [n for n in merged.graph.node if n.op_type == "Div" and len(n.output) == 1 and n.output[0] == div_out]
+    if not sub_nodes or not div_nodes:
+        raise RuntimeError("Failed to insert standardization nodes")
+    if enc_out not in sub_nodes[0].input:
+        raise RuntimeError("Encoder output is not feeding the Sub node")
+    if sub_out not in div_nodes[0].input:
+        raise RuntimeError("Sub output is not feeding the Div node")
+    head_consumers = [n for n in merged.graph.node if n.name.startswith(prefix) and div_out in n.input]
+    if not head_consumers:
+        raise RuntimeError("Standardized embedding does not reach the head")
 
     for vi in head.graph.value_info:
         new_vi = onnx.ValueInfoProto()
@@ -314,11 +391,19 @@ def main():
         new_o.name = map_name(o.name)
         merged.graph.output.append(new_o)
 
-    print("DEBUG:")
-    print(" final outputs:", [o.name for o in merged.graph.output])
-
     if len(merged.graph.output) != len(head.graph.output):
         raise RuntimeError("Failed to propagate head outputs into merged graph")
+
+    def _dims(vi):
+        return [
+            d.dim_value if d.HasField("dim_value") else None
+            for d in vi.type.tensor_type.shape.dim
+        ]
+
+    out_dims = _dims(merged.graph.output[0])
+    known_out_dims = [d for d in out_dims if d is not None]
+    if known_out_dims and 2 not in known_out_dims:
+        raise RuntimeError(f"Head output does not look like a 2-value VA tensor: {out_dims}")
 
     try:
         inferred = onnx.shape_inference.infer_shapes(merged)
@@ -335,6 +420,7 @@ def main():
 if __name__ == "__main__":
     main()
 # @path: merged_runner.py
+
 import argparse
 import numpy as np
 import onnxruntime as ort
@@ -486,40 +572,38 @@ if __name__ == "__main__":
     main()
 # @path: quantize_encoder.py
 
-from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantFormat, QuantType
-import glob, os, librosa, numpy as np, sys, onnxruntime as ort
+from onnxruntime.quantization import (
+    CalibrationDataReader,
+    QuantFormat,
+    QuantType,
+    quantize_static,
+)
+import glob
+import os
+import sys
 
-MODEL=sys.argv[1]
-OUT=sys.argv[2]
-CALIB_DIR=sys.argv[3]
+import numpy as np
+import onnxruntime as ort
 
-SR=16000
-N_FFT=512
-HOP=256
-N_MELS=96
-FRAMES=187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
 
-def make_mel(path):
-    y,_ = librosa.load(path, sr=SR, mono=True)
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype('float32')
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-    return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
+MODEL = sys.argv[1]
+OUT = sys.argv[2]
+CALIB_DIR = sys.argv[3]
 
 sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
 INPUT_NAME = sess.get_inputs()[0].name
+INPUT_SHAPE = sess.get_inputs()[0].shape
 print("Detected model input:", INPUT_NAME)
 
 class MelReader(CalibrationDataReader):
@@ -533,16 +617,34 @@ class MelReader(CalibrationDataReader):
         except StopIteration:
             return None
 
-        mel = make_mel(f)
+        y = load_audio(f, sr=DEFAULT_SR)
+        mel = make_mel_patch(
+            y,
+            sr=DEFAULT_SR,
+            n_fft=DEFAULT_N_FFT,
+            hop=DEFAULT_HOP,
+            n_mels=DEFAULT_N_MELS,
+            frames=DEFAULT_FRAMES,
+            power=DEFAULT_POWER,
+        )
+        inp = prepare_input_for_model(
+            mel,
+            INPUT_SHAPE,
+            frames=DEFAULT_FRAMES,
+            n_mels=DEFAULT_N_MELS,
+        )
 
         return {
-            INPUT_NAME: mel[np.newaxis].astype('float32')
+            INPUT_NAME: inp.astype(np.float32)
         }
 
     def rewind(self):
         self.iter = iter(self.files)
 
-files = glob.glob(os.path.join(CALIB_DIR, "*.wav"))
+files = sorted(glob.glob(os.path.join(CALIB_DIR, "*.wav")))
+
+if not files:
+    raise RuntimeError("No calibration WAV files found in " + CALIB_DIR)
 
 dr = MelReader(files)
 
@@ -559,58 +661,60 @@ quantize_static(
 print("Wrote", OUT)
 # @path: quantize_head.py
 
-import os
-import sys
+import argparse
 import glob
+import os
+
 import numpy as np
-import librosa
 import onnxruntime as ort
 
 from onnxruntime.quantization import (
-    quantize_static,
     CalibrationDataReader,
     QuantFormat,
     QuantType,
+    quantize_static,
 )
 
-MODEL = sys.argv[1]
-OUT = sys.argv[2]
-CALIB_DIR = sys.argv[3]
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+parser = argparse.ArgumentParser()
+parser.add_argument("model")
+parser.add_argument("out")
+parser.add_argument("calib_dir")
+parser.add_argument("--encoder", required=True, help="Encoder ONNX used to produce calibration embeddings")
+parser.add_argument("--emb-mean", required=True, help="Calibration embedding mean .npy")
+parser.add_argument("--emb-std", required=True, help="Calibration embedding std .npy")
+args = parser.parse_args()
 
-sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
-INPUT_NAME = sess.get_inputs()[0].name
-print("Detected model input:", INPUT_NAME)
+MODEL = args.model
+OUT = args.out
+CALIB_DIR = args.calib_dir
+ENCODER_PATH = args.encoder
+EMB_MEAN_PATH = args.emb_mean
+EMB_STD_PATH = args.emb_std
 
-def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
+enc_sess = ort.InferenceSession(ENCODER_PATH, providers=["CPUExecutionProvider"])
+enc_input_name = enc_sess.get_inputs()[0].name
+enc_input_shape = enc_sess.get_inputs()[0].shape
+head_sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
+HEAD_INPUT_NAME = head_sess.get_inputs()[0].name
+HEAD_INPUT_SHAPE = head_sess.get_inputs()[0].shape
+print("Detected head input:", HEAD_INPUT_NAME)
 
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0,
-    )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype(np.float32)
-
-    if mel_db.shape[0] >= FRAMES:
-        mel_db = mel_db[:FRAMES]
-    else:
-        pad = FRAMES - mel_db.shape[0]
-        pad_val = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-        mel_db = np.vstack(
-            [mel_db, np.full((pad, N_MELS), pad_val, dtype=np.float32)]
-        )
-
-    return mel_db
+emb_mean = np.load(EMB_MEAN_PATH).astype(np.float32)
+emb_std = np.load(EMB_STD_PATH).astype(np.float32)
 
 class MelReader(CalibrationDataReader):
 
@@ -626,10 +730,30 @@ class MelReader(CalibrationDataReader):
         f = self.files[self.index]
         self.index += 1
 
-        mel = make_mel(f)
+        y = load_audio(f, sr=DEFAULT_SR)
+        mel = make_mel_patch(
+            y,
+            sr=DEFAULT_SR,
+            n_fft=DEFAULT_N_FFT,
+            hop=DEFAULT_HOP,
+            n_mels=DEFAULT_N_MELS,
+            frames=DEFAULT_FRAMES,
+            power=DEFAULT_POWER,
+        )
+        enc_inp = prepare_input_for_model(
+            mel,
+            enc_input_shape,
+            frames=DEFAULT_FRAMES,
+            n_mels=DEFAULT_N_MELS,
+        ).astype(np.float32)
+        emb = np.asarray(
+            enc_sess.run(None, {enc_input_name: enc_inp})[0]
+        ).squeeze()
+        std_emb = standardize_embedding(emb, emb_mean, emb_std)
+        head_inp = prepare_vector_for_model(std_emb, HEAD_INPUT_SHAPE)
 
         return {
-            INPUT_NAME: mel[np.newaxis, :, :].astype(np.float32)
+            HEAD_INPUT_NAME: head_inp.astype(np.float32)
         }
 
     def rewind(self):
@@ -655,51 +779,108 @@ quantize_static(
 )
 
 print("Quantized model written to:", OUT)
+# @path: quantize_merged.py
+
+import argparse
+import glob
+import os
+
+import numpy as np
+import onnxruntime as ort
+from onnxruntime.quantization import (
+    CalibrationDataReader,
+    QuantFormat,
+    QuantType,
+    quantize_static,
+)
+
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model")
+    parser.add_argument("out")
+    parser.add_argument("calib_dir")
+    args = parser.parse_args()
+
+    sess = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    input_shape = sess.get_inputs()[0].shape
+    print("Detected merged input:", input_name)
+
+    files = sorted(glob.glob(os.path.join(args.calib_dir, "*.wav")))
+    if not files:
+        raise RuntimeError("No calibration WAV files found in " + args.calib_dir)
+
+    class MelReader(CalibrationDataReader):
+        def __init__(self, paths):
+            self.paths = paths
+            self.index = 0
+
+        def get_next(self):
+            if self.index >= len(self.paths):
+                return None
+            f = self.paths[self.index]
+            self.index += 1
+            y = load_audio(f, sr=DEFAULT_SR)
+            mel = make_mel_patch(
+                y,
+                sr=DEFAULT_SR,
+                n_fft=DEFAULT_N_FFT,
+                hop=DEFAULT_HOP,
+                n_mels=DEFAULT_N_MELS,
+                frames=DEFAULT_FRAMES,
+                power=DEFAULT_POWER,
+            )
+            inp = prepare_input_for_model(
+                mel,
+                input_shape,
+                frames=DEFAULT_FRAMES,
+                n_mels=DEFAULT_N_MELS,
+            )
+            return {input_name: inp.astype(np.float32)}
+
+        def rewind(self):
+            self.index = 0
+
+    reader = MelReader(files)
+
+    quantize_static(
+        args.model,
+        args.out,
+        reader,
+        quant_format=QuantFormat.QDQ,
+        per_channel=False,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+    )
+
+    print("Quantized merged model written to:", args.out)
+
+if __name__ == "__main__":
+    main()
 # @path: run_inference.py
 
 import argparse
 import numpy as np
-import librosa
 import onnxruntime as ort
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187 
-
-def load_audio(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-    return y
-
-def make_mel_patch(y):
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
-    )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db_t = mel_db.T.astype(np.float32)
-
-    T = mel_db_t.shape[0]
-
-    if T >= FRAMES:
-        patch = mel_db_t[:FRAMES, :]
-    else:
-        pad_rows = FRAMES - T
-        pad_value = mel_db_t.min() if T > 0 else -80.0
-        patch = np.vstack([
-            mel_db_t,
-            np.full((pad_rows, N_MELS), pad_value, dtype=np.float32)
-        ])
-
-    return patch
+from audio_utils import load_audio, make_mel_patch, prepare_input_for_model
 
 def apply_activation(output, mode):
+    output = np.asarray(output, dtype=np.float32).reshape(-1)
+    if output.size != 2:
+        raise RuntimeError(f"Expected 2 output values, got shape {output.shape}")
     val, aro = output
 
     if mode == "tanh":
@@ -719,13 +900,11 @@ def apply_activation(output, mode):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
     parser.add_argument("--audio", required=True)
-    parser.add_argument("--encoder", required=True)
-    parser.add_argument("--head", required=True)
-    parser.add_argument("--emb-mean", required=True)
-    parser.add_argument("--emb-std", required=True)
-    parser.add_argument("--activation", default="tanh",
+    parser.add_argument("--activation", default="raw",
                         choices=["raw", "tanh", "sigmoid"])
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     print("Loading audio:", args.audio)
@@ -734,45 +913,27 @@ def main():
     mel_patch = make_mel_patch(y)
     print("Mel patch shape:", mel_patch.shape)
 
-    enc_sess = ort.InferenceSession(
-        args.encoder,
+    sess = ort.InferenceSession(
+        args.model,
         providers=["CPUExecutionProvider"]
     )
 
-    enc_input_name = enc_sess.get_inputs()[0].name
+    input_meta = sess.get_inputs()[0]
+    input_name = input_meta.name
+    model_input = prepare_input_for_model(
+        mel_patch,
+        input_meta.shape,
+    )
 
-    emb = enc_sess.run(
+    out = sess.run(
         None,
-        {enc_input_name: mel_patch[np.newaxis, :, :].astype(np.float32)}
+        {input_name: model_input.astype(np.float32)}
     )[0]
+    raw_output = np.asarray(out).squeeze().astype(np.float32)
+    if raw_output.size != 2:
+        raise RuntimeError(f"Expected merged model to return 2 values, got shape {raw_output.shape}")
 
-    print("Raw embedding shape:", emb.shape)
-    print("Raw embedding mean:", emb.mean())
-    print("Raw embedding std:", emb.std())
-
-    emb_mean = np.load(args.emb_mean)
-    emb_std = np.load(args.emb_std)
-
-    emb_std = np.where(emb_std < 1e-8, 1.0, emb_std)
-
-    emb_stdized = (emb - emb_mean) / emb_std
-
-    print("Standardized embedding mean:", emb_stdized.mean())
-    print("Standardized embedding std:", emb_stdized.std())
-
-    head_sess = ort.InferenceSession(
-        args.head,
-        providers=["CPUExecutionProvider"]
-    )
-
-    head_input_name = head_sess.get_inputs()[0].name
-
-    raw_output = head_sess.run(
-        None,
-        {head_input_name: emb_stdized.astype(np.float32)}
-    )[0][0]
-
-    print("Raw head output:", raw_output)
+    print("Raw model output:", raw_output.tolist())
 
     valence, arousal = apply_activation(raw_output, args.activation)
 
@@ -785,36 +946,33 @@ if __name__ == "__main__":
 
 import onnxruntime as ort
 import numpy as np
-import librosa
 import sys
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype("float32")
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-
-    return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
 
 if len(sys.argv) != 6:
     print("Usage: run_two_stage.py ENCODER_QDQ HEAD_QDQ MEAN_NPY STD_NPY TEST_WAV")
@@ -836,14 +994,23 @@ head_sess = ort.InferenceSession(HEAD, providers=["CPUExecutionProvider"])
 
 enc_input = enc_sess.get_inputs()[0].name
 head_input = head_sess.get_inputs()[0].name
+enc_input_shape = enc_sess.get_inputs()[0].shape
+head_input_shape = head_sess.get_inputs()[0].shape
 
-emb = enc_sess.run(None, {enc_input: mel[np.newaxis].astype("float32")})[0]
+enc_inp = prepare_input_for_model(
+    mel,
+    enc_input_shape,
+    frames=DEFAULT_FRAMES,
+    n_mels=DEFAULT_N_MELS,
+).astype(np.float32)
+
+emb = enc_sess.run(None, {enc_input: enc_inp})[0]
 emb = np.array(emb).squeeze().astype("float32")
 
-std_safe = np.where(std == 0.0, 1.0, std)
-std_emb = ((emb - mean) / std_safe).astype("float32")
+std_emb = standardize_embedding(emb, mean, std)
+head_inp = prepare_vector_for_model(std_emb, head_input_shape)
 
-head_out = head_sess.run(None, {head_input: std_emb[np.newaxis]})[0]
+head_out = head_sess.run(None, {head_input: head_inp.astype(np.float32)})[0]
 head_out = np.array(head_out).squeeze()
 
 print("Head pre-tanh:", head_out.tolist())
@@ -883,16 +1050,24 @@ print("Merged model has outputs:", [o.name for o in merged.graph.output])
 onnx.save(merged, out_path)
 print("Saved merged model:", out_path)
 # @path: validation.py
+
 import sys
 import numpy as np
-import librosa
 import onnxruntime as ort
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
 
 AUDIO_PATH = "test.wav"
 
@@ -904,33 +1079,16 @@ EMB_MEAN = "emb_mean.npy"
 EMB_STD = "emb_std.npy"
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db = mel_db.T.astype(np.float32)
-
-    T = mel_db.shape[0]
-
-    if T >= FRAMES:
-        mel_db = mel_db[:FRAMES, :]
-    else:
-        pad_rows = FRAMES - T
-        pad_value = mel_db.min() if T > 0 else -80.0
-        mel_db = np.vstack([
-            mel_db,
-            np.full((pad_rows, N_MELS), pad_value, dtype=np.float32)
-        ])
-
-    return mel_db
 
 def python_pipeline(mel):
     enc_sess = ort.InferenceSession(ENCODER, providers=["CPUExecutionProvider"])
@@ -938,37 +1096,53 @@ def python_pipeline(mel):
 
     enc_input = enc_sess.get_inputs()[0].name
     head_input = head_sess.get_inputs()[0].name
+    enc_shape = enc_sess.get_inputs()[0].shape
+    head_shape = head_sess.get_inputs()[0].shape
+
+    enc_inp = prepare_input_for_model(
+        mel,
+        enc_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     emb = enc_sess.run(
         None,
-        {enc_input: mel[np.newaxis, :, :]}
+        {enc_input: enc_inp.astype(np.float32)}
     )[0]
 
     emb_mean = np.load(EMB_MEAN)
     emb_std = np.load(EMB_STD)
-    emb_std = np.where(emb_std < 1e-8, 1.0, emb_std)
+    emb_std = np.asarray(emb_std, dtype=np.float32)
 
-    emb_stdized = (emb - emb_mean) / emb_std
+    emb_stdized = standardize_embedding(emb, emb_mean, emb_std)
+    head_inp = prepare_vector_for_model(emb_stdized, head_shape)
 
     raw = head_sess.run(
         None,
-        {head_input: emb_stdized.astype(np.float32)}
+        {head_input: head_inp.astype(np.float32)}
     )[0][0]
 
-    final = np.tanh(raw)
-
-    return final
+    return np.asarray(raw, dtype=np.float32).reshape(-1)
 
 def merged_pipeline(mel):
     sess = ort.InferenceSession(MERGED, providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
+    input_shape = sess.get_inputs()[0].shape
+
+    inp = prepare_input_for_model(
+        mel,
+        input_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     out = sess.run(
         None,
-        {input_name: mel[np.newaxis, :, :]}
+        {input_name: inp.astype(np.float32)}
     )[0][0]
 
-    return out
+    return np.asarray(out, dtype=np.float32).reshape(-1)
 
 if __name__ == "__main__":
     mel = make_mel(AUDIO_PATH)
@@ -991,7 +1165,7 @@ if __name__ == "__main__":
         print(f"ERROR: expected merged output shape (2,), got {merged_out.shape}", file=sys.stderr)
         sys.exit(2)
 
-    if diff.max() >= 1e-3:
+    if diff.max() >= 1e-4:
         print(f"ERROR: parity check failed, max diff={diff.max():.6e}", file=sys.stderr)
         sys.exit(3)
 # @path: verify_merged.py
@@ -999,36 +1173,28 @@ if __name__ == "__main__":
 import argparse
 import numpy as np
 import onnxruntime as ort
-import librosa
-
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0,
-    )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype(np.float32)
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    pad_val = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-
-    return np.vstack(
-        [mel_db, np.full((pad, N_MELS), pad_val, dtype=np.float32)]
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
 
 def run_onnx(model_path, mel):
@@ -1038,10 +1204,17 @@ def run_onnx(model_path, mel):
     )
 
     input_name = sess.get_inputs()[0].name
+    input_shape = sess.get_inputs()[0].shape
+    inp = prepare_input_for_model(
+        mel,
+        input_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     outputs = sess.run(
         None,
-        {input_name: mel[np.newaxis].astype(np.float32)}
+        {input_name: inp.astype(np.float32)}
     )
 
     return outputs[0][0]

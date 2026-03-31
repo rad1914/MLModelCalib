@@ -3,36 +3,28 @@
 import argparse
 import numpy as np
 import onnxruntime as ort
-import librosa
-
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0,
-    )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype(np.float32)
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    pad_val = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-
-    return np.vstack(
-        [mel_db, np.full((pad, N_MELS), pad_val, dtype=np.float32)]
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
 
 def run_onnx(model_path, mel):
@@ -42,10 +34,17 @@ def run_onnx(model_path, mel):
     )
 
     input_name = sess.get_inputs()[0].name
+    input_shape = sess.get_inputs()[0].shape
+    inp = prepare_input_for_model(
+        mel,
+        input_shape,
+        frames=DEFAULT_FRAMES,
+        n_mels=DEFAULT_N_MELS,
+    )
 
     outputs = sess.run(
         None,
-        {input_name: mel[np.newaxis].astype(np.float32)}
+        {input_name: inp.astype(np.float32)}
     )
 
     return outputs[0][0]

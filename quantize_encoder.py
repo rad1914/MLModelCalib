@@ -1,39 +1,37 @@
 # @path: quantize_encoder.py
 
-from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantFormat, QuantType
-import glob, os, librosa, numpy as np, sys, onnxruntime as ort
+from onnxruntime.quantization import (
+    CalibrationDataReader,
+    QuantFormat,
+    QuantType,
+    quantize_static,
+)
+import glob
+import os
+import sys
 
-MODEL=sys.argv[1]
-OUT=sys.argv[2]
-CALIB_DIR=sys.argv[3]
+import numpy as np
+import onnxruntime as ort
 
-SR=16000
-N_FFT=512
-HOP=256
-N_MELS=96
-FRAMES=187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+)
 
-def make_mel(path):
-    y,_ = librosa.load(path, sr=SR, mono=True)
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype('float32')
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-    return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
+MODEL = sys.argv[1]
+OUT = sys.argv[2]
+CALIB_DIR = sys.argv[3]
 
 sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
 INPUT_NAME = sess.get_inputs()[0].name
+INPUT_SHAPE = sess.get_inputs()[0].shape
 print("Detected model input:", INPUT_NAME)
 
 class MelReader(CalibrationDataReader):
@@ -47,16 +45,34 @@ class MelReader(CalibrationDataReader):
         except StopIteration:
             return None
 
-        mel = make_mel(f)
+        y = load_audio(f, sr=DEFAULT_SR)
+        mel = make_mel_patch(
+            y,
+            sr=DEFAULT_SR,
+            n_fft=DEFAULT_N_FFT,
+            hop=DEFAULT_HOP,
+            n_mels=DEFAULT_N_MELS,
+            frames=DEFAULT_FRAMES,
+            power=DEFAULT_POWER,
+        )
+        inp = prepare_input_for_model(
+            mel,
+            INPUT_SHAPE,
+            frames=DEFAULT_FRAMES,
+            n_mels=DEFAULT_N_MELS,
+        )
 
         return {
-            INPUT_NAME: mel[np.newaxis].astype('float32')
+            INPUT_NAME: inp.astype(np.float32)
         }
 
     def rewind(self):
         self.iter = iter(self.files)
 
-files = glob.glob(os.path.join(CALIB_DIR, "*.wav"))
+files = sorted(glob.glob(os.path.join(CALIB_DIR, "*.wav")))
+
+if not files:
+    raise RuntimeError("No calibration WAV files found in " + CALIB_DIR)
 
 dr = MelReader(files)
 

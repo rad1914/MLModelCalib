@@ -53,7 +53,7 @@ function getPathComment(relPath, fileType, ext) {
 
 function removeExistingPathComments(content) {
   return content.replace(
-    /^\s*(?:\/\/|#|<!--)\s*@path:.*?(?:-->)?\s*$/gm,
+    /^\s*(\/\/|#|<!--)\s*@path:\s*.+?(?:-->)?\s*$/gm,
     ''
   );
 }
@@ -103,9 +103,8 @@ async function processFile(filePath) {
     const firstLines = content.split('\n').slice(0, 20).join('\n');
     const existingPath = extractExistingPath(firstLines);
 
-    content = removeExistingPathComments(content);
-
     if (existingPath !== relPath) {
+      content = removeExistingPathComments(content);
       content = insertPathComment(content, commentLine, fileType, ext);
       console.log(`Updated @path: ${relPath}`);
     } else {

@@ -2,36 +2,33 @@
 
 import onnxruntime as ort
 import numpy as np
-import librosa
 import sys
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    load_audio,
+    make_mel_patch,
+    prepare_input_for_model,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
 
 def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
+    y = load_audio(path, sr=DEFAULT_SR)
+    return make_mel_patch(
+        y,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
     )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype("float32")
-
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-
-    pad = FRAMES - mel_db.shape[0]
-    padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-
-    return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
 
 if len(sys.argv) != 6:
     print("Usage: run_two_stage.py ENCODER_QDQ HEAD_QDQ MEAN_NPY STD_NPY TEST_WAV")
@@ -53,14 +50,23 @@ head_sess = ort.InferenceSession(HEAD, providers=["CPUExecutionProvider"])
 
 enc_input = enc_sess.get_inputs()[0].name
 head_input = head_sess.get_inputs()[0].name
+enc_input_shape = enc_sess.get_inputs()[0].shape
+head_input_shape = head_sess.get_inputs()[0].shape
 
-emb = enc_sess.run(None, {enc_input: mel[np.newaxis].astype("float32")})[0]
+enc_inp = prepare_input_for_model(
+    mel,
+    enc_input_shape,
+    frames=DEFAULT_FRAMES,
+    n_mels=DEFAULT_N_MELS,
+).astype(np.float32)
+
+emb = enc_sess.run(None, {enc_input: enc_inp})[0]
 emb = np.array(emb).squeeze().astype("float32")
 
-std_safe = np.where(std == 0.0, 1.0, std)
-std_emb = ((emb - mean) / std_safe).astype("float32")
+std_emb = standardize_embedding(emb, mean, std)
+head_inp = prepare_vector_for_model(std_emb, head_input_shape)
 
-head_out = head_sess.run(None, {head_input: std_emb[np.newaxis]})[0]
+head_out = head_sess.run(None, {head_input: head_inp.astype(np.float32)})[0]
 head_out = np.array(head_out).squeeze()
 
 print("Head pre-tanh:", head_out.tolist())
