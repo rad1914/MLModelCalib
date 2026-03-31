@@ -1,18 +1,4 @@
 # @path: merged_runner.py
-
-"""
-merged_runner.py
-
-Usage examples:
-  python merged_runner.py --merged merged_std_correct.onnx --test test.wav --mean emb_mean.npy --std emb_std.npy --head deam_head.onnx
-  python merged_runner.py --merged merged_std_correct.onnx --test test.wav --mean emb_mean.npy --std emb_std.npy --encoder msd_musicnn.onnx --head deam_head.onnx
-
-Behavior:
- - Runs merged model; if output shape == 2 -> prints valence/arousal.
- - If merged output length == embedding_dim (== mean.size) -> standardize -> run head ONNX -> print VA.
- - If merged output is large (> embedding_dim) and head provided -> run encoder+head to compute head_out and search for close slice inside merged output.
- - Prints diagnostics (shapes, L2 diffs).
-"""
 import argparse
 import numpy as np
 import onnxruntime as ort
@@ -53,7 +39,6 @@ def run_head_on_std_emb(head_path: str, std_emb: np.ndarray) -> np.ndarray:
     return out.squeeze()
 
 def find_best_slice(big: np.ndarray, small: np.ndarray):
-
     big1 = big.ravel()
     small1 = small.ravel()
     n, m = big1.size, small1.size
@@ -94,6 +79,13 @@ def main():
     merged_out = np.array(merged_out).squeeze()
     print("merged_out shape:", merged_out.shape, "size:", merged_out.size)
 
+    if args.verbose:
+        if merged_out.size not in (2, 200):
+            print("WARNING: unexpected output size:", merged_out.size)
+
+        print("merged_out dtype:", merged_out.dtype)
+        print("merged_out first_10:", merged_out.ravel()[:10].tolist())
+
     if merged_out.size == 2:
         va = merged_out.ravel()
         print("Merged model produced valence/arousal:", va.tolist())
@@ -105,6 +97,15 @@ def main():
     if mean is not None and merged_out.size == mean.size:
         if args.verbose:
             print("Merged output length equals mean length -> interpreting as embedding")
+            print("mean.shape:", mean.shape, "std.shape:", None if std is None else std.shape)
+        if std is None:
+            print("ERROR: std missing for embedding interpretation", file=sys.stderr)
+            sys.exit(2)
+
+        if mean.shape[0] != 200:
+            print("ERROR: unexpected embedding size", mean.shape, file=sys.stderr)
+            sys.exit(3)
+
         emb = merged_out.astype(np.float32).reshape(mean.shape)
         std_safe = np.where(std == 0.0, 1.0, std) if std is not None else np.ones_like(mean)
         std_emb = (emb - mean) / std_safe

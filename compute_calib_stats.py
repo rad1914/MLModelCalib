@@ -1,4 +1,5 @@
 # @path: compute_calib_stats.py
+
 from __future__ import annotations
 import os
 import sys
@@ -16,7 +17,7 @@ DEFAULT_FRAMES = 187
 DEFAULT_WIN_SEC = 3.0
 DEFAULT_HOP_SEC = 1.0
 EPS_STD_FLOOR = 1e-6
-REPLACE_SMALL_STD_WITH = 1.0
+STD_FLOOR = 1e-6
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compute embedding mean/std from WAV calibration set")
@@ -96,8 +97,7 @@ def prepare_input_for_model(patch: np.ndarray, model_input_shape, frames: int, n
 
 def open_session(model_path: str) -> ort.InferenceSession:
     try:
-        sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-        return sess
+        return ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
     except Exception as e:
         print("Error: Failed to open ONNX model:", e, file=sys.stderr)
         raise
@@ -106,10 +106,8 @@ def compute_stats_from_embeddings(emb_list: List[np.ndarray]) -> Tuple[np.ndarra
     embs = np.stack(emb_list, axis=0)
     mean = embs.mean(axis=0)
     std = embs.std(axis=0)
-    small_mask = std < EPS_STD_FLOOR
-    if small_mask.any():
-        std[small_mask] = REPLACE_SMALL_STD_WITH
-    return mean.astype(np.float32), std.astype(np.float32), embs.shape[0]
+    std = np.maximum(std, STD_FLOOR)
+    return mean.astype(np.float32), std.astype(np.float32), int(embs.shape[0])
 
 def main():
     args = parse_args()

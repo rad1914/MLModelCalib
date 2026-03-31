@@ -1,5 +1,5 @@
 # @path: validation.py
-
+import sys
 import numpy as np
 import librosa
 import onnxruntime as ort
@@ -98,3 +98,15 @@ if __name__ == "__main__":
     diff = np.abs(py_out - merged_out)
     print("Absolute diff  :", diff)
     print("Max diff       :", diff.max())
+    print("L2 diff        :", float(np.linalg.norm(py_out - merged_out)))
+
+    print("Python out:", py_out.tolist())
+    print("Merged out:", merged_out.tolist())
+
+    if merged_out.shape != (2,):
+        print(f"ERROR: expected merged output shape (2,), got {merged_out.shape}", file=sys.stderr)
+        sys.exit(2)
+
+    if diff.max() >= 1e-3:
+        print(f"ERROR: parity check failed, max diff={diff.max():.6e}", file=sys.stderr)
+        sys.exit(3)
