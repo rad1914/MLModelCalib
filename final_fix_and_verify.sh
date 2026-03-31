@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
+# @path: final_fix_and_verify.sh
+
 set -euo pipefail
 
-# basic paths (adjust if needed)
 CALIB_DIR="calib_wavs"
 ENCODER="msd_musicnn.onnx"
 HEAD="deam_head.onnx"

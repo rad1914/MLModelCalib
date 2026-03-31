@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# @path: compute_calib_stats.py
 from __future__ import annotations
 import os
 import sys
@@ -61,7 +61,7 @@ def make_mel_patch(y: np.ndarray, sr: int, n_fft: int, hop: int, n_mels: int, fr
     mel_db = mel_ds.T
 
     if mel_db.shape[0] >= frames:
-        start = (mel_db.shape[0] - frames) // 2
+        start = (mel_db.shape[0] - frames)
         patch = mel_db[start:start+frames].astype(np.float32)
     else:
         pad_val = float(mel_db.min()) if mel_db.size else -80.0

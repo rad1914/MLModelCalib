@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-# stitch_encoder_head.py
+# @path: stitch_encoder_head.py
+
 import onnx
 from onnx import helper
 from onnx.compose import merge_models
@@ -11,7 +11,7 @@ if len(sys.argv) != 5:
     sys.exit(1)
 
 encoder_path = sys.argv[1]
-# encoder_name param left for compatibility; not used but kept for CLI shape
+
 encoder_name = sys.argv[2]
 head_path = sys.argv[3]
 out_path = sys.argv[4]
@@ -26,11 +26,8 @@ head_in_name = head.graph.input[0].name
 
 print("Connecting encoder output '{}' -> head input '{}'".format(enc_out_name, head_in_name))
 
-# merge encoder and head, wiring output->input
 merged = merge_models(enc, head, io_map=[(enc_out_name, head_in_name)])
 
-# Ensure final graph output name is sensible (use head's output name)
-# (merge_models should have preserved head output names)
 print("Merged model has outputs:", [o.name for o in merged.graph.output])
 
 onnx.save(merged, out_path)

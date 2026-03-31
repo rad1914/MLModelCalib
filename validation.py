@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
+# @path: validation.py
+
 import numpy as np
 import librosa
 import onnxruntime as ort
 
-# =====================
-# CONSTANTS
-# =====================
 SR = 16000
 N_FFT = 512
 HOP = 256
@@ -21,10 +19,6 @@ MERGED = "merged_std_correct_qdq.onnx"
 EMB_MEAN = "emb_mean.npy"
 EMB_STD = "emb_std.npy"
 
-
-# =====================
-# MEL CREATION
-# =====================
 def make_mel(path):
     y, _ = librosa.load(path, sr=SR, mono=True)
 
@@ -54,10 +48,6 @@ def make_mel(path):
 
     return mel_db
 
-
-# =====================
-# PYTHON FLOAT PIPELINE
-# =====================
 def python_pipeline(mel):
     enc_sess = ort.InferenceSession(ENCODER, providers=["CPUExecutionProvider"])
     head_sess = ort.InferenceSession(HEAD, providers=["CPUExecutionProvider"])
@@ -85,10 +75,6 @@ def python_pipeline(mel):
 
     return final
 
-
-# =====================
-# MERGED PIPELINE
-# =====================
 def merged_pipeline(mel):
     sess = ort.InferenceSession(MERGED, providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
@@ -100,10 +86,6 @@ def merged_pipeline(mel):
 
     return out
 
-
-# =====================
-# MAIN
-# =====================
 if __name__ == "__main__":
     mel = make_mel(AUDIO_PATH)
 

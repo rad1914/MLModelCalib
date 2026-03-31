@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# run_two_stage.py
+# @path: run_two_stage.py
 
 import onnxruntime as ort
 import numpy as np
@@ -33,7 +32,6 @@ def make_mel(path):
     padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
 
     return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
-
 
 if len(sys.argv) != 6:
     print("Usage: run_two_stage.py ENCODER_QDQ HEAD_QDQ MEAN_NPY STD_NPY TEST_WAV")

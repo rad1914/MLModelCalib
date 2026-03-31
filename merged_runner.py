@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+# @path: merged_runner.py
+
 """
 merged_runner.py
 
@@ -39,7 +40,7 @@ def run_onnx(model_path: str, input_arr: np.ndarray) -> np.ndarray:
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     inp_name = sess.get_inputs()[0].name
     out = sess.run(None, {inp_name: input_arr.astype(np.float32)})
-    # pick first output
+
     out0 = np.array(out[0])
     return out0.squeeze()
 
@@ -52,7 +53,7 @@ def run_head_on_std_emb(head_path: str, std_emb: np.ndarray) -> np.ndarray:
     return out.squeeze()
 
 def find_best_slice(big: np.ndarray, small: np.ndarray):
-    # naive sliding L2 search (works for 1D arrays). Returns (best_offset, best_l2, slice)
+
     big1 = big.ravel()
     small1 = small.ravel()
     n, m = big1.size, small1.size
@@ -93,17 +94,14 @@ def main():
     merged_out = np.array(merged_out).squeeze()
     print("merged_out shape:", merged_out.shape, "size:", merged_out.size)
 
-    # Case 1: merged already returns valence/arousal
     if merged_out.size == 2:
         va = merged_out.ravel()
         print("Merged model produced valence/arousal:", va.tolist())
         return
 
-    # Load mean/std if present
     mean = safe_load_np(args.mean) if args.mean else None
     std = safe_load_np(args.std) if args.std else None
 
-    # Case 2: merged returns embedding vector same size as mean
     if mean is not None and merged_out.size == mean.size:
         if args.verbose:
             print("Merged output length equals mean length -> interpreting as embedding")
@@ -117,7 +115,6 @@ def main():
         print("Valence/Arousal from head (merged->std_emb->head):", head_out.tolist())
         return
 
-    # Case 3: merged is large (logits or full vector). If head + encoder available, compute head_out and search slice
     if args.head and args.encoder:
         print("Merged output != 2 and != emb_dim. Will compute encoder->head and search for a matching slice inside merged output.")
         enc_emb = run_encoder_get_emb(args.encoder, mel)
@@ -131,7 +128,7 @@ def main():
             std_emb = enc_emb
         head_out = run_head_on_std_emb(args.head, std_emb)
         print("Computed head_out (encoder->std->head):", head_out.tolist())
-        # search merged_out for a close slice
+
         res = find_best_slice(merged_out, head_out)
         if res is None:
             print("Head output longer than merged output or no match possible.")
@@ -143,7 +140,6 @@ def main():
             print("Head_out:", head_out.tolist())
         return
 
-    # Otherwise we can't do much
     print("Merged model produced an output of size", merged_out.size)
     print("No mean/std or head/encoder provided to interpret it further.")
     if args.verbose:

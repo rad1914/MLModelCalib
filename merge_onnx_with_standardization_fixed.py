@@ -1,3 +1,5 @@
+# @path: merge_onnx_with_standardization_fixed.py
+
 import sys
 import onnx
 import numpy as np
@@ -16,11 +18,9 @@ def main():
     enc_out = enc.graph.output[0].name
     head_in  = head.graph.input[0].name
 
-    # Load stats
     mean = np.load(mean_path).astype(np.float32)
     std  = np.load(std_path).astype(np.float32)
 
-    # ---------- Build merged base ----------
     merged = ModelProto()
     merged.CopyFrom(enc)
 
@@ -36,8 +36,6 @@ def main():
     div_node = helper.make_node("Div", [sub_out, "std_std_const"],  [div_out], name="std_div")
     merged.graph.node.extend([sub_node, div_node])
 
-    # ---------- Collect all value names in head ----------
-    # These must ALL be prefixed to avoid collisions
     prefix = "head_"
     all_names = set()
 
@@ -51,22 +49,18 @@ def main():
     for o in head.graph.output:
         all_names.add(o.name)
 
-    # Do NOT prefix the head's main input
     all_names.discard(head_in)
 
-    # Map names -> prefixed names
     name_map = {name: prefix + name for name in all_names}
 
     def map_name(n):
         return name_map.get(n, n)
 
-    # ---------- Copy head initializers ----------
     for init in head.graph.initializer:
         arr = numpy_helper.to_array(init)
         new_name = map_name(init.name)
         merged.graph.initializer.append(numpy_helper.from_array(arr, name=new_name))
 
-    # ---------- Copy head nodes with fully remapped names ----------
     for node in head.graph.node:
         mapped_inputs = [div_out if inp == head_in else map_name(inp) for inp in node.input]
         mapped_outputs = [map_name(out) for out in node.output]
@@ -80,14 +74,12 @@ def main():
             new_node.attribute.extend([attr])
         merged.graph.node.append(new_node)
 
-    # ---------- Copy value_info (optional but cleaner) ----------
     for vi in head.graph.value_info:
         new_vi = onnx.ValueInfoProto()
         new_vi.CopyFrom(vi)
         new_vi.name = map_name(vi.name)
         merged.graph.value_info.append(new_vi)
 
-    # ---------- Replace merged output with prefixed head outputs ----------
     merged.graph.output.clear()
     for o in head.graph.output:
         new_o = onnx.ValueInfoProto()
@@ -95,7 +87,6 @@ def main():
         new_o.name = map_name(o.name)
         merged.graph.output.append(new_o)
 
-    # ---------- Validate ----------
     try:
         inferred = onnx.shape_inference.infer_shapes(merged)
         onnx.checker.check_model(inferred)

@@ -1,7 +1,4 @@
-
-#!/usr/bin/env python3
-# quantize_head.py
-# Static QDQ quantization for merged MusiCNN + DEAM model (mel input)
+# @path: quantize_head.py
 
 import os
 import sys
@@ -17,17 +14,9 @@ from onnxruntime.quantization import (
     QuantType,
 )
 
-# ======================
-# CLI
-# ======================
-
 MODEL = sys.argv[1]
 OUT = sys.argv[2]
 CALIB_DIR = sys.argv[3]
-
-# ======================
-# AUDIO PARAMS (MUST MATCH TRAINING)
-# ======================
 
 SR = 16000
 N_FFT = 512
@@ -35,17 +24,9 @@ HOP = 256
 N_MELS = 96
 FRAMES = 187
 
-# ======================
-# DETECT MODEL INPUT NAME
-# ======================
-
 sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
 INPUT_NAME = sess.get_inputs()[0].name
 print("Detected model input:", INPUT_NAME)
-
-# ======================
-# MEL GENERATION
-# ======================
 
 def make_mel(path):
     y, _ = librosa.load(path, sr=SR, mono=True)
@@ -72,10 +53,6 @@ def make_mel(path):
 
     return mel_db
 
-# ======================
-# CALIBRATION READER
-# ======================
-
 class MelReader(CalibrationDataReader):
 
     def __init__(self, files):
@@ -99,10 +76,6 @@ class MelReader(CalibrationDataReader):
     def rewind(self):
         self.index = 0
 
-# ======================
-# LOAD CALIB FILES
-# ======================
-
 files = sorted(glob.glob(os.path.join(CALIB_DIR, "*.wav")))
 
 if not files:
@@ -111,10 +84,6 @@ if not files:
 print("Calibration files:", len(files))
 
 reader = MelReader(files)
-
-# ======================
-# QUANTIZATION
-# ======================
 
 quantize_static(
     MODEL,

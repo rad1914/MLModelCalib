@@ -1,3 +1,4 @@
+# @path: CalibrationDataReader.py
 import librosa
 
 SR = 16000
@@ -5,7 +6,6 @@ N_FFT = 512
 HOP = 256
 N_MELS = 96
 FRAMES = 187
-
 
 def make_mel(path):
     y, _ = librosa.load(path, sr=SR, mono=True)
@@ -31,7 +31,6 @@ def make_mel(path):
         )
 
     return mel_db
-
 
 class MelReader(CalibrationDataReader):
     def __init__(self, files):

@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# quantize_encoder.py (FIXED)
+# @path: quantize_encoder.py
 
 from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantFormat, QuantType
 import glob, os, librosa, numpy as np, sys, onnxruntime as ort
@@ -33,7 +32,6 @@ def make_mel(path):
     padv = mel_db.min() if mel_db.shape[0] > 0 else -80.0
     return np.vstack([mel_db, np.full((pad, N_MELS), padv, dtype=np.float32)])
 
-# Detect real input name automatically
 sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
 INPUT_NAME = sess.get_inputs()[0].name
 print("Detected model input:", INPUT_NAME)

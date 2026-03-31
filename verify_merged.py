@@ -1,17 +1,15 @@
-#!/usr/bin/env python3
+# @path: verify_merged.py
 
 import argparse
 import numpy as np
 import onnxruntime as ort
 import librosa
 
-
 SR = 16000
 N_FFT = 512
 HOP = 256
 N_MELS = 96
 FRAMES = 187
-
 
 def make_mel(path):
     y, _ = librosa.load(path, sr=SR, mono=True)
@@ -37,7 +35,6 @@ def make_mel(path):
         [mel_db, np.full((pad, N_MELS), pad_val, dtype=np.float32)]
     )
 
-
 def run_onnx(model_path, mel):
     sess = ort.InferenceSession(
         model_path,
@@ -53,7 +50,6 @@ def run_onnx(model_path, mel):
 
     return outputs[0][0]
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -67,7 +63,6 @@ def main():
 
     print("Model:", args.model)
     print("Output:", out)
-
 
 if __name__ == "__main__":
     main()
