@@ -1,13 +1,12 @@
 # @path: compute_calib_stats.py
-
 from __future__ import annotations
+
 import argparse
 import os
 import sys
 from typing import List, Tuple
 
 import numpy as np
-import onnxruntime as ort
 
 from audio_utils import (
     DEFAULT_FRAMES,
@@ -17,9 +16,8 @@ from audio_utils import (
     DEFAULT_POWER,
     DEFAULT_SR,
     STD_FLOOR,
-    load_audio,
-    make_mel_patch,
-    prepare_input_for_model,
+    build_model_input_from_path,
+    get_cpu_session,
 )
 
 def parse_args() -> argparse.Namespace:
@@ -34,19 +32,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--n-mels', type=int, default=DEFAULT_N_MELS, help='Number of mel bins')
     p.add_argument('--frames', type=int, default=DEFAULT_FRAMES, help='Number of frames (time axis) expected by the model')
     p.add_argument('--power', type=float, default=DEFAULT_POWER, help='Power for mel spectrogram (2.0 for power)')
+    p.add_argument('--min-samples', type=int, default=5, help='Minimum successfully embedded clips required')
     p.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
     return p.parse_args()
 
 def list_wavs(calib_dir: str) -> List[str]:
-    files = sorted([f for f in os.listdir(calib_dir) if f.lower().endswith('.wav')])
-    return files
+    return sorted(
+        os.path.join(calib_dir, f)
+        for f in os.listdir(calib_dir)
+        if f.lower().endswith('.wav')
+    )
 
-def prepare_input_for_model(patch: np.ndarray, model_input_shape, frames: int, n_mels: int) -> np.ndarray:
-    return prepare_input_for_model(patch, model_input_shape, frames=frames, n_mels=n_mels)
-
-def open_session(model_path: str) -> ort.InferenceSession:
+def open_session(model_path: str):
     try:
-        return ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        return get_cpu_session(model_path)
     except Exception as e:
         print("Error: Failed to open ONNX model:", e, file=sys.stderr)
         raise
@@ -57,6 +56,19 @@ def compute_stats_from_embeddings(emb_list: List[np.ndarray]) -> Tuple[np.ndarra
     std = embs.std(axis=0)
     std = np.maximum(std, STD_FLOOR)
     return mean.astype(np.float32), std.astype(np.float32), int(embs.shape[0])
+
+def _output_dim_hint(output_shape) -> int | None:
+    dims = []
+    for dim in output_shape or []:
+        try:
+            dims.append(int(dim))
+        except Exception:
+            dims.append(None)
+
+    for dim in reversed(dims):
+        if dim is not None and dim > 0:
+            return dim
+    return None
 
 def main():
     args = parse_args()
@@ -78,43 +90,55 @@ def main():
     input_meta = sess.get_inputs()[0]
     in_name = input_meta.name
     in_shape = input_meta.shape
+    out_meta = sess.get_outputs()[0]
+    expected_dim = _output_dim_hint(out_meta.shape)
+
     if args.verbose:
         print("Model input name:", in_name, "shape:", in_shape)
+        print("Model output name:", out_meta.name, "shape:", out_meta.shape)
+        if expected_dim is not None:
+            print("Expected embedding dim from model output metadata:", expected_dim)
 
     emb_list = []
+    failed = 0
     total_patches = 0
-    for i, fname in enumerate(wavs, 1):
-        path = os.path.join(args.calib, fname)
-        try:
-            y = load_audio(path, sr=args.sr)
-        except Exception as e:
-            print(f"Warning: failed to load {fname}: {e}", file=sys.stderr)
-            continue
+    emb_dim = expected_dim
 
-        patch = make_mel_patch(
-            y,
-            sr=args.sr,
-            n_fft=args.n_fft,
-            hop=args.hop,
-            n_mels=args.n_mels,
-            frames=args.frames,
-            power=args.power,
-        )
-        inp = prepare_input_for_model(patch, in_shape, frames=args.frames, n_mels=args.n_mels).astype(np.float32)
+    for i, path in enumerate(wavs, 1):
+        fname = os.path.basename(path)
         try:
+            inp = build_model_input_from_path(
+                path,
+                in_shape,
+                sr=args.sr,
+                n_fft=args.n_fft,
+                hop=args.hop,
+                n_mels=args.n_mels,
+                frames=args.frames,
+                power=args.power,
+            ).astype(np.float32)
             out = sess.run(None, {in_name: inp})
         except Exception as e:
-            print(f"Warning: model inference failed on {fname}: {e}", file=sys.stderr)
+            failed += 1
+            print(f"Warning: failed on {fname}: {e}", file=sys.stderr)
             continue
-        if not out or len(out[0].shape) == 0:
-            print(f"Warning: unexpected encoder output shape for {fname}", file=sys.stderr)
+
+        if not out:
+            failed += 1
+            print(f"Warning: unexpected encoder output for {fname}", file=sys.stderr)
             continue
-        emb = np.asarray(out[0]).reshape(-1)
 
-        if emb.shape[0] != 200:
-            raise RuntimeError(f"Unexpected embedding dim {emb.shape[0]}")
+        emb = np.asarray(out[0], dtype=np.float32).reshape(-1)
+        if emb_dim is None:
+            emb_dim = int(emb.size)
+            if args.verbose:
+                print("Inferred embedding dim from first successful sample:", emb_dim)
+        elif emb.size != emb_dim:
+            raise RuntimeError(
+                f"Embedding dim mismatch for {fname}: got {emb.size}, expected {emb_dim}"
+            )
 
-        emb_list.append(emb.astype(np.float32))
+        emb_list.append(emb)
         total_patches += 1
 
         if args.verbose:
@@ -124,12 +148,21 @@ def main():
         print("ERROR: No embeddings were produced. Check model input shape and calibration audio.", file=sys.stderr)
         sys.exit(4)
 
+    if len(emb_list) < max(1, args.min_samples):
+        print(
+            f"ERROR: Only {len(emb_list)} calibration samples succeeded; "
+            f"minimum required is {args.min_samples}.",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+
     mean, std, n_samples = compute_stats_from_embeddings(emb_list)
 
     np.save(args.out_mean, mean)
     np.save(args.out_std, std)
     print(f"Saved {args.out_mean} and {args.out_std}")
     print(f"Samples (patches): {n_samples}, embedding dim: {mean.shape[0]}")
+    print(f"Failed files: {failed}")
     print(f"Embedding mean(mean) = {float(mean.mean()):.6f}, embedding mean(std) = {float(std.mean()):.6f}")
 
 if __name__ == '__main__':

@@ -1,11 +1,9 @@
 # @path: quantize_head.py
-
 import argparse
 import glob
 import os
 
 import numpy as np
-import onnxruntime as ort
 
 from onnxruntime.quantization import (
     CalibrationDataReader,
@@ -21,9 +19,8 @@ from audio_utils import (
     DEFAULT_N_MELS,
     DEFAULT_POWER,
     DEFAULT_SR,
-    load_audio,
-    make_mel_patch,
-    prepare_input_for_model,
+    build_model_input_from_path,
+    get_cpu_session,
     prepare_vector_for_model,
     standardize_embedding,
 )
@@ -44,16 +41,25 @@ ENCODER_PATH = args.encoder
 EMB_MEAN_PATH = args.emb_mean
 EMB_STD_PATH = args.emb_std
 
-enc_sess = ort.InferenceSession(ENCODER_PATH, providers=["CPUExecutionProvider"])
+enc_sess = get_cpu_session(ENCODER_PATH)
 enc_input_name = enc_sess.get_inputs()[0].name
 enc_input_shape = enc_sess.get_inputs()[0].shape
-head_sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
+head_sess = get_cpu_session(MODEL)
 HEAD_INPUT_NAME = head_sess.get_inputs()[0].name
 HEAD_INPUT_SHAPE = head_sess.get_inputs()[0].shape
 print("Detected head input:", HEAD_INPUT_NAME)
 
-emb_mean = np.load(EMB_MEAN_PATH).astype(np.float32)
-emb_std = np.load(EMB_STD_PATH).astype(np.float32)
+def _load_stats(path):
+    arr = np.load(path, allow_pickle=False)
+    arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        raise RuntimeError(f"Empty calibration stats in {path}")
+    if not np.isfinite(arr).all():
+        raise RuntimeError(f"Non-finite calibration stats in {path}")
+    return arr
+
+emb_mean = _load_stats(EMB_MEAN_PATH)
+emb_std = _load_stats(EMB_STD_PATH)
 
 class MelReader(CalibrationDataReader):
 
@@ -69,21 +75,15 @@ class MelReader(CalibrationDataReader):
         f = self.files[self.index]
         self.index += 1
 
-        y = load_audio(f, sr=DEFAULT_SR)
-        mel = make_mel_patch(
-            y,
+        enc_inp = build_model_input_from_path(
+            f,
+            enc_input_shape,
             sr=DEFAULT_SR,
             n_fft=DEFAULT_N_FFT,
             hop=DEFAULT_HOP,
             n_mels=DEFAULT_N_MELS,
             frames=DEFAULT_FRAMES,
             power=DEFAULT_POWER,
-        )
-        enc_inp = prepare_input_for_model(
-            mel,
-            enc_input_shape,
-            frames=DEFAULT_FRAMES,
-            n_mels=DEFAULT_N_MELS,
         ).astype(np.float32)
         emb = np.asarray(
             enc_sess.run(None, {enc_input_name: enc_inp})[0]

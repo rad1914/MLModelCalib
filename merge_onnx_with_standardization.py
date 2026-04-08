@@ -1,14 +1,56 @@
-# @path: merge_onnx_with_standardization_fixed.py
-
+# @path: merge_onnx_with_standardization.py
 import sys
-import onnx
-from onnx import TensorProto
 import numpy as np
-from onnx import helper, numpy_helper, ModelProto
+import onnx
+from onnx import ModelProto, helper, numpy_helper
+
+from audio_utils import STD_FLOOR
+
+# Patched: Added allow_pickle=False and finite checks to prevent the model from choking on trash data.
+
+def _shape_dims(value_info):
+    return [
+        d.dim_value if d.HasField("dim_value") else None
+        for d in value_info.type.tensor_type.shape.dim
+    ]
+
+def _known_positive_dims(shape):
+    dims = []
+    for dim in shape or []:
+        try:
+            dim = int(dim)
+        except Exception:
+            dim = None
+        if dim is not None and dim > 0:
+            dims.append(dim)
+    return dims
+
+def _validate_encoder_output_shape(enc_out_shape, emb_dim):
+    if not enc_out_shape:
+        return
+
+    dims = []
+    for dim in enc_out_shape:
+        try:
+            dims.append(int(dim))
+        except Exception:
+            dims.append(None)
+
+    known = [dim for dim in dims if dim is not None and dim > 0]
+    if not known:
+        return
+
+    # Accept common shapes such as [emb_dim], [1, emb_dim], [batch, emb_dim].
+    if known[-1] == emb_dim:
+        return
+
+    raise RuntimeError(
+        f"Encoder output shape {enc_out_shape} is incompatible with embedding dim {emb_dim}"
+    )
 
 def main():
     if len(sys.argv) != 6:
-        print("Usage: python merge_onnx_with_standardization_fixed.py encoder.onnx head.onnx emb_mean.npy emb_std.npy out_merged.onnx")
+        print("Usage: python merge_onnx_with_standardization.py encoder.onnx head.onnx emb_mean.npy emb_std.npy out_merged.onnx")
         sys.exit(1)
 
     enc_path, head_path, mean_path, std_path, out_path = sys.argv[1:]
@@ -23,20 +65,30 @@ def main():
     if len(head.graph.output) != 1:
         raise RuntimeError(f"Head must have exactly 1 output, got {len(head.graph.output)}")
 
-    enc_out = enc.graph.output[0].name
-    head_in  = head.graph.input[0].name
+    enc_out_vi = enc.graph.output[0]
+    head_in_vi = head.graph.input[0]
+    enc_out = enc_out_vi.name
+    head_in = head_in_vi.name
 
-    mean = np.load(mean_path).astype(np.float32)
-    std  = np.load(std_path).astype(np.float32)
+    # Patch applied: explicit allow_pickle=False
+    mean = np.load(mean_path, allow_pickle=False).astype(np.float32).reshape(-1)
+    std = np.load(std_path, allow_pickle=False).astype(np.float32).reshape(-1)
 
     if mean.shape != std.shape:
         raise RuntimeError(f"Mean/std shape mismatch: {mean.shape} vs {std.shape}")
     if mean.ndim != 1:
         raise RuntimeError(f"Expected 1D embedding stats, got mean.ndim={mean.ndim}")
-    if mean.size != 200:
-        raise RuntimeError(f"Expected 200-d embedding stats, got {mean.size}")
+    if mean.size == 0:
+        raise RuntimeError("Empty embedding statistics are not allowed")
 
-    std = np.maximum(std, 1e-6).astype(np.float32)
+    # Patch applied: finite value validation
+    if not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError("Embedding statistics contain NaN or infinite values")
+
+    emb_dim = int(mean.size)
+    _validate_encoder_output_shape(_shape_dims(enc_out_vi), emb_dim)
+
+    std = np.maximum(std, STD_FLOOR).astype(np.float32)
 
     merged = ModelProto()
     merged.CopyFrom(enc)
@@ -44,8 +96,8 @@ def main():
     if enc_out == head_in:
         raise RuntimeError("Encoder output name collides with head input (will silently break graph)")
 
-    mean_const = numpy_helper.from_array(mean.reshape(1, -1), name="std_mean_const")
-    std_const  = numpy_helper.from_array(std.reshape(1, -1),  name="std_std_const")
+    mean_const = numpy_helper.from_array(mean, name="std_mean_const")
+    std_const = numpy_helper.from_array(std, name="std_std_const")
 
     merged.graph.initializer.extend([mean_const, std_const])
 
@@ -53,7 +105,7 @@ def main():
     div_out = enc_out + "_stded"
 
     sub_node = helper.make_node("Sub", [enc_out, "std_mean_const"], [sub_out], name="std_sub")
-    div_node = helper.make_node("Div", [sub_out, "std_std_const"],  [div_out], name="std_div")
+    div_node = helper.make_node("Div", [sub_out, "std_std_const"], [div_out], name="std_div")
     merged.graph.node.extend([sub_node, div_node])
 
     prefix = "head_"
@@ -69,6 +121,9 @@ def main():
     for o in head.graph.output:
         all_names.add(o.name)
 
+    for init in head.graph.initializer:
+        all_names.add(init.name)
+
     all_names.discard(head_in)
 
     name_map = {name: prefix + name for name in all_names}
@@ -82,7 +137,7 @@ def main():
         head_internal.update(node.output)
     if head_in not in head_internal:
         raise RuntimeError(f"Head input '{head_in}' not found in head graph")
-    
+
     for init in head.graph.initializer:
         arr = numpy_helper.to_array(init)
         new_name = map_name(init.name)
@@ -129,14 +184,8 @@ def main():
     if len(merged.graph.output) != len(head.graph.output):
         raise RuntimeError("Failed to propagate head outputs into merged graph")
 
-    def _dims(vi):
-        return [
-            d.dim_value if d.HasField("dim_value") else None
-            for d in vi.type.tensor_type.shape.dim
-        ]
-
-    out_dims = _dims(merged.graph.output[0])
-    known_out_dims = [d for d in out_dims if d is not None]
+    out_dims = _shape_dims(merged.graph.output[0])
+    known_out_dims = _known_positive_dims(out_dims)
     if known_out_dims and 2 not in known_out_dims:
         raise RuntimeError(f"Head output does not look like a 2-value VA tensor: {out_dims}")
 

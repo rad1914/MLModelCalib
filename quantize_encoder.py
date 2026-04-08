@@ -1,5 +1,4 @@
 # @path: quantize_encoder.py
-
 from onnxruntime.quantization import (
     CalibrationDataReader,
     QuantFormat,
@@ -11,7 +10,6 @@ import os
 import sys
 
 import numpy as np
-import onnxruntime as ort
 
 from audio_utils import (
     DEFAULT_FRAMES,
@@ -20,16 +18,15 @@ from audio_utils import (
     DEFAULT_N_MELS,
     DEFAULT_POWER,
     DEFAULT_SR,
-    load_audio,
-    make_mel_patch,
-    prepare_input_for_model,
+    build_model_input_from_path,
+    get_cpu_session,
 )
 
 MODEL = sys.argv[1]
 OUT = sys.argv[2]
 CALIB_DIR = sys.argv[3]
 
-sess = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
+sess = get_cpu_session(MODEL)
 INPUT_NAME = sess.get_inputs()[0].name
 INPUT_SHAPE = sess.get_inputs()[0].shape
 print("Detected model input:", INPUT_NAME)
@@ -45,21 +42,15 @@ class MelReader(CalibrationDataReader):
         except StopIteration:
             return None
 
-        y = load_audio(f, sr=DEFAULT_SR)
-        mel = make_mel_patch(
-            y,
+        inp = build_model_input_from_path(
+            f,
+            INPUT_SHAPE,
             sr=DEFAULT_SR,
             n_fft=DEFAULT_N_FFT,
             hop=DEFAULT_HOP,
             n_mels=DEFAULT_N_MELS,
             frames=DEFAULT_FRAMES,
             power=DEFAULT_POWER,
-        )
-        inp = prepare_input_for_model(
-            mel,
-            INPUT_SHAPE,
-            frames=DEFAULT_FRAMES,
-            n_mels=DEFAULT_N_MELS,
         )
 
         return {

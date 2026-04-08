@@ -1,11 +1,10 @@
 # @path: quantize_merged.py
-
 import argparse
 import glob
 import os
 
 import numpy as np
-import onnxruntime as ort
+
 from onnxruntime.quantization import (
     CalibrationDataReader,
     QuantFormat,
@@ -20,9 +19,8 @@ from audio_utils import (
     DEFAULT_N_MELS,
     DEFAULT_POWER,
     DEFAULT_SR,
-    load_audio,
-    make_mel_patch,
-    prepare_input_for_model,
+    build_model_input_from_path,
+    get_cpu_session,
 )
 
 def main():
@@ -32,7 +30,7 @@ def main():
     parser.add_argument("calib_dir")
     args = parser.parse_args()
 
-    sess = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
+    sess = get_cpu_session(args.model)
     input_name = sess.get_inputs()[0].name
     input_shape = sess.get_inputs()[0].shape
     print("Detected merged input:", input_name)
@@ -51,21 +49,15 @@ def main():
                 return None
             f = self.paths[self.index]
             self.index += 1
-            y = load_audio(f, sr=DEFAULT_SR)
-            mel = make_mel_patch(
-                y,
+            inp = build_model_input_from_path(
+                f,
+                input_shape,
                 sr=DEFAULT_SR,
                 n_fft=DEFAULT_N_FFT,
                 hop=DEFAULT_HOP,
                 n_mels=DEFAULT_N_MELS,
                 frames=DEFAULT_FRAMES,
                 power=DEFAULT_POWER,
-            )
-            inp = prepare_input_for_model(
-                mel,
-                input_shape,
-                frames=DEFAULT_FRAMES,
-                n_mels=DEFAULT_N_MELS,
             )
             return {input_name: inp.astype(np.float32)}
 

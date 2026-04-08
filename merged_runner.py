@@ -1,64 +1,78 @@
 # @path: merged_runner.py
-
 import argparse
-import numpy as np
-import onnxruntime as ort
-import librosa
-import sys
 from typing import Optional
 
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
+import numpy as np
+import sys
 
-def make_mel(path: str) -> np.ndarray:
-    y, _ = librosa.load(path, sr=SR, mono=True)
-    mel = librosa.feature.melspectrogram(y=y, sr=SR, n_fft=N_FFT, hop_length=HOP, n_mels=N_MELS, power=2.0)
-    mel_db = librosa.power_to_db(mel, ref=np.max).T.astype(np.float32)
-    if mel_db.shape[0] >= FRAMES:
-        return mel_db[:FRAMES]
-    pad = FRAMES - mel_db.shape[0]
-    pad_val = mel_db.min() if mel_db.shape[0] > 0 else -80.0
-    return np.vstack([mel_db, np.full((pad, N_MELS), pad_val, dtype=np.float32)])
+from audio_utils import (
+    DEFAULT_FRAMES,
+    DEFAULT_HOP,
+    DEFAULT_N_FFT,
+    DEFAULT_N_MELS,
+    DEFAULT_POWER,
+    DEFAULT_SR,
+    get_cpu_session,
+    load_mel_patch,
+    prepare_vector_for_model,
+    standardize_embedding,
+)
+
+def make_mel(path):
+    return load_mel_patch(
+        path,
+        sr=DEFAULT_SR,
+        n_fft=DEFAULT_N_FFT,
+        hop=DEFAULT_HOP,
+        n_mels=DEFAULT_N_MELS,
+        frames=DEFAULT_FRAMES,
+        power=DEFAULT_POWER,
+    )
 
 def run_onnx(model_path: str, input_arr: np.ndarray) -> np.ndarray:
-    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    sess = get_cpu_session(model_path)
     inp_name = sess.get_inputs()[0].name
     out = sess.run(None, {inp_name: input_arr.astype(np.float32)})
-
-    out0 = np.array(out[0])
-    return out0.squeeze()
+    return np.asarray(out[0], dtype=np.float32).squeeze()
 
 def run_encoder_get_emb(encoder_path: str, mel: np.ndarray) -> np.ndarray:
-    emb = run_onnx(encoder_path, mel[np.newaxis])
-    return emb.squeeze()
+    return run_onnx(encoder_path, mel[np.newaxis]).squeeze()
 
 def run_head_on_std_emb(head_path: str, std_emb: np.ndarray) -> np.ndarray:
-    out = run_onnx(head_path, std_emb[np.newaxis])
-    return out.squeeze()
+    return run_onnx(head_path, std_emb[np.newaxis]).squeeze()
 
 def find_best_slice(big: np.ndarray, small: np.ndarray):
-    big1 = big.ravel()
-    small1 = small.ravel()
+    big1 = np.asarray(big, dtype=np.float32).ravel()
+    small1 = np.asarray(small, dtype=np.float32).ravel()
     n, m = big1.size, small1.size
     if m > n:
         return None
-    best_i = None
-    best_l2 = float("inf")
-    for i in range(0, n - m + 1):
-        s = big1[i:i+m]
-        d = np.linalg.norm(s - small1)
-        if d < best_l2:
-            best_l2 = d
-            best_i = i
-    return best_i, best_l2
+    windows = np.lib.stride_tricks.sliding_window_view(big1, m)
+    dists = np.linalg.norm(windows - small1, axis=1)
+    best_i = int(np.argmin(dists))
+    return best_i, float(dists[best_i])
 
 def safe_load_np(path: Optional[str]) -> Optional[np.ndarray]:
     if path is None:
         return None
-    return np.load(path)
+    arr = np.load(path, allow_pickle=False)
+    arr = np.asarray(arr, dtype=np.float32)
+    if not np.isfinite(arr).all():
+        raise ValueError(f"Non-finite values found in {path}")
+    return arr
+
+def _output_dim_hint(output_shape) -> int | None:
+    dims = []
+    for dim in output_shape or []:
+        try:
+            dims.append(int(dim))
+        except Exception:
+            dims.append(None)
+
+    for dim in reversed(dims):
+        if dim is not None and dim > 0:
+            return dim
+    return None
 
 def main():
     p = argparse.ArgumentParser()
@@ -75,25 +89,28 @@ def main():
     if args.verbose:
         print("mel.shape:", mel.shape)
 
+    merged_sess = get_cpu_session(args.merged)
+    merged_input = merged_sess.get_inputs()[0]
+    merged_hint = _output_dim_hint(merged_sess.get_outputs()[0].shape)
+
     print("Running merged model:", args.merged)
-    merged_out = run_onnx(args.merged, mel[np.newaxis])
-    merged_out = np.array(merged_out).squeeze()
+    merged_out = np.asarray(
+        merged_sess.run(None, {merged_input.name: mel[np.newaxis].astype(np.float32)})[0],
+        dtype=np.float32,
+    ).squeeze()
     print("merged_out shape:", merged_out.shape, "size:", merged_out.size)
 
     if args.verbose:
-        if merged_out.size not in (2, 200):
-            print("WARNING: unexpected output size:", merged_out.size)
-
         print("merged_out dtype:", merged_out.dtype)
         print("merged_out first_10:", merged_out.ravel()[:10].tolist())
 
-    if merged_out.size == 2:
-        va = merged_out.ravel()
-        print("Merged model produced valence/arousal:", va.tolist())
-        return
-
     mean = safe_load_np(args.mean) if args.mean else None
     std = safe_load_np(args.std) if args.std else None
+
+    if mean is not None:
+        mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+    if std is not None:
+        std = np.asarray(std, dtype=np.float32).reshape(-1)
 
     if mean is not None and merged_out.size == mean.size:
         if args.verbose:
@@ -102,14 +119,12 @@ def main():
         if std is None:
             print("ERROR: std missing for embedding interpretation", file=sys.stderr)
             sys.exit(2)
-
-        if mean.shape[0] != 200:
-            print("ERROR: unexpected embedding size", mean.shape, file=sys.stderr)
+        if std.size != mean.size:
+            print("ERROR: std size mismatch", file=sys.stderr)
             sys.exit(3)
 
         emb = merged_out.astype(np.float32).reshape(mean.shape)
-        std_safe = np.where(std == 0.0, 1.0, std) if std is not None else np.ones_like(mean)
-        std_emb = (emb - mean) / std_safe
+        std_emb = standardize_embedding(emb, mean, std)
         if args.head is None:
             print("HEAD model is required to process standardized embedding. Provide --head path.")
             sys.exit(2)
@@ -117,15 +132,22 @@ def main():
         print("Valence/Arousal from head (merged->std_emb->head):", head_out.tolist())
         return
 
+    if merged_hint == 2 and merged_out.size == 2:
+        va = merged_out.ravel()
+        print("Merged model produced valence/arousal:", va.tolist())
+        return
+
     if args.head and args.encoder:
-        print("Merged output != 2 and != emb_dim. Will compute encoder->head and search for a matching slice inside merged output.")
-        enc_emb = run_encoder_get_emb(args.encoder, mel)
-        enc_emb = np.array(enc_emb).squeeze()
+        print("Merged output is not a 2-value VA tensor and does not match the embedding stats size. Running encoder->head parity search.")
+        enc_emb = np.asarray(run_encoder_get_emb(args.encoder, mel), dtype=np.float32).squeeze()
         if mean is not None:
-            mean = mean.reshape(enc_emb.shape)
-            std = std.reshape(enc_emb.shape)
-            std_safe = np.where(std == 0.0, 1.0, std)
-            std_emb = (enc_emb - mean) / std_safe
+            if std is None:
+                print("ERROR: std missing for embedding standardization", file=sys.stderr)
+                sys.exit(2)
+            if mean.size != enc_emb.size or std.size != enc_emb.size:
+                print("ERROR: calibration vectors do not match encoder embedding size", file=sys.stderr)
+                sys.exit(3)
+            std_emb = standardize_embedding(enc_emb, mean, std)
         else:
             std_emb = enc_emb
         head_out = run_head_on_std_emb(args.head, std_emb)
@@ -137,7 +159,7 @@ def main():
         else:
             offset, l2 = res
             print(f"Best-match slice at offset {offset} with L2={l2:.6e}")
-            candidate = merged_out.ravel()[offset:offset+head_out.size]
+            candidate = merged_out.ravel()[offset:offset + head_out.size]
             print("Candidate slice:", candidate.tolist())
             print("Head_out:", head_out.tolist())
         return
