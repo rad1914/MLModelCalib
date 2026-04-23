@@ -7,14 +7,14 @@ len(a) < 6 and sys.exit("Usage: merge_and_stitch.py ENC HEAD MEAN STD OUT [--pre
 p = a[a.index("--prefix")+1] if "--prefix" in a else "h_"
 enc = onnx.load(a[1])
 head = add_prefix(onnx.load(a[2]), p)
-m = merge_models(enc, head, io_map=[(enc.graph.output[0].name, head.graph.input[0].name)])
-g = m.graph
+merged = merge_models(enc, head, io_map=[(enc.graph.output[0].name, head.graph.input[0].name)])
+g = merged.graph
 eo = enc.graph.output[0].name
 hi = head.graph.input[0].name
-g.initializer += [
+g.initializer.extend([
     nh.from_array(np.load(a[3]).astype(np.float32), "mean"),
-    nh.from_array(np.load(a[4]).astype(np.float32), "std")
-]
+    nh.from_array(np.load(a[4]).astype(np.float32), "std"),
+])
 sub_out = eo + "_sub"
 div_out = eo + "_div"
 idx = next((i for i, n in enumerate(g.node) if hi in n.input), len(g.node))
@@ -31,7 +31,8 @@ if "--tanh" in a:
     g.output[0].name = t
     for v in g.value_info:
         if v.name == o: v.name = t
-onnx.save(onnx.shape_inference.infer_shapes(m), a[5])
+g.ClearField("value_info")
+onnx.save(merged, a[5])
 #!/usr/bin/env python3
 # @path: fix_opset.py
 import onnx,sys
@@ -201,25 +202,6 @@ g.value_info += [
     helper.make_tensor_value_info(div, TensorProto.FLOAT, ['N', mean.size])
 ]
 onnx.save(m, a.o)
-# @path: quantize_head.py
-import sys, glob, os, numpy as np, librosa, onnxruntime as ort
-from onnxruntime.quantization import *
-M,O,D=sys.argv[1:4]
-SR,NF,H,NM,F=16000,512,256,96,187
-I=ort.InferenceSession(M,providers=["CPUExecutionProvider"]).get_inputs()[0].name
-def m(p):
-    y,_=librosa.load(p,sr=SR,mono=True)
-    x=librosa.power_to_db(librosa.feature.melspectrogram(y=y,sr=SR,n_fft=NF,hop_length=H,n_mels=NM),ref=np.max).T.astype(np.float32)
-    return np.vstack([x,np.full((F-len(x),NM),x.min() if len(x) else -80,np.float32)])[:F]
-class R(CalibrationDataReader):
-    def __init__(s,f):s.f=f;s.i=0
-    def get_next(s):
-        if s.i>=len(s.f):return
-        x=m(s.f[s.i]);s.i+=1
-        return {I:x[None].astype(np.float32)}
-f=sorted(glob.glob(os.path.join(D,"*.wav")))
-if not f:raise RuntimeError("No WAVs")
-quantize_static(M,O,R(f),quant_format=QuantFormat.QDQ,per_channel=False,activation_type=QuantType.QInt8,weight_type=QuantType.QInt8)
 #!/usr/bin/env python3
 # @path: runners.py
 import os, sys, json, argparse
@@ -259,29 +241,76 @@ emb=(emb-mean)/(std+1e-12)
 out=run(ort.InferenceSession(a.head,providers=["CPUExecutionProvider"]),emb.reshape(1,-1))
 print(json.dumps({"output":act[a.activation](out)[0].tolist()}))
 #!/usr/bin/env python3
+# @path: quantize_model.py
+import argparse
+import onnx
+from onnxruntime.quantization import QuantType, quantize_dynamic
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("model_in")
+    p.add_argument("model_out")
+    p.add_argument("calib_dir")
+    args = p.parse_args()
+    quantize_dynamic(
+        args.model_in,
+        args.model_out,
+        weight_type=QuantType.QInt8,
+        op_types_to_quantize=["MatMul", "Gemm"],
+        extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT},
+    )
+    print("Saved:", args.model_out)
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
 # @path: compute_calib_stats.py
-import os, sys, numpy as np, onnxruntime as ort
+import os, sys, argparse, numpy as np, onnxruntime as ort
 from audio_utils import load_audio_mono, make_mel_patch
-m = sys.argv[1] if len(sys.argv)>1 else 'msd_musicnn.onnx'
-d = sys.argv[2] if len(sys.argv)>2 else 'calib_wavs'
-if not (os.path.isfile(m) and os.path.isdir(d)): sys.exit(2)
-sess = ort.InferenceSession(m, providers=['CPUExecutionProvider'])
-inp = sess.get_inputs()[0]
-name, shape = inp.name, inp.shape
-def prep(x):
-    x = x.astype(np.float32)
-    return x[None, None] if len(shape)==4 else x[None]
-E=[]
-for f in os.listdir(d):
-    if not f.lower().endswith('.wav'): continue
-    y = load_audio_mono(os.path.join(d,f))
-    x = make_mel_patch(y)
-    try:
-        out = sess.run(None, {name: prep(x)})[0]
-        E.append(out.reshape(-1))
-    except: pass
-if not E: sys.exit(4)
-E = np.stack(E)
-std = E.std(0); std[std<1e-6]=1
-np.save('emb_mean.npy', E.mean(0).astype(np.float32))
-np.save('emb_std.npy', std.astype(np.float32))
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("-m", "--model", default="msd_musicnn.onnx")
+    p.add_argument("-c", "--calib", default="calib_wavs")
+    p.add_argument("--out-mean", default="emb_mean.npy")
+    p.add_argument("--out-std", default="emb_std.npy")
+    a = p.parse_args()
+    if not os.path.isfile(a.model):
+        sys.exit(f"Missing model: {a.model}")
+    if not os.path.isdir(a.calib):
+        sys.exit(f"Missing calib dir: {a.calib}")
+    sess = ort.InferenceSession(a.model, providers=["CPUExecutionProvider"])
+    inp = sess.get_inputs()[0]
+    shape = inp.shape
+    name = inp.name
+    def prep(x):
+        x = x.astype(np.float32)
+        if len(shape) == 4:
+            return x[None, None]
+        return x[None]
+    files = [f for f in sorted(os.listdir(a.calib)) if f.lower().endswith(".wav")]
+    total = len(files)
+    if total == 0:
+        sys.exit("No WAV files found")
+    E = []
+    done = 0
+    for i, f in enumerate(files, 1):
+        pth = os.path.join(a.calib, f)
+        try:
+            y = load_audio_mono(pth)
+            x = make_mel_patch(y)
+            out = sess.run(None, {name: prep(x)})[0]
+            E.append(out.reshape(-1))
+            done += 1
+        except Exception as e:
+            print(f"[skip] {pth}: {e}", file=sys.stderr)
+        print(f"\r[{i}/{total}] processed={done}", end="", flush=True)
+    print()
+    if not E:
+        sys.exit("No valid WAVs processed")
+    E = np.stack(E).astype(np.float32)
+    std = E.std(0).astype(np.float32)
+    std[std < 1e-6] = 1.0
+    np.save(a.out_mean, E.mean(0).astype(np.float32))
+    np.save(a.out_std, std)
+    print(f"Saved: {a.out_mean}")
+    print(f"Saved: {a.out_std}")
+if __name__ == "__main__":
+    main()
