@@ -1,118 +1,66 @@
 #!/usr/bin/env python3
-import numpy as np
-import librosa
-import onnxruntime as ort
-
-# =====================
-# CONSTANTS
-# =====================
-SR = 16000
-N_FFT = 512
-HOP = 256
-N_MELS = 96
-FRAMES = 187
-
-AUDIO_PATH = "test.wav"
-
-ENCODER = "msd_musicnn.onnx"
-HEAD = "deam_head.onnx"
-MERGED = "merged_std_correct_qdq.onnx"
-
-EMB_MEAN = "emb_mean.npy"
-EMB_STD = "emb_std.npy"
-
-
-# =====================
-# MEL CREATION
-# =====================
-def make_mel(path):
-    y, _ = librosa.load(path, sr=SR, mono=True)
-
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=SR,
-        n_fft=N_FFT,
-        hop_length=HOP,
-        n_mels=N_MELS,
-        power=2.0
+# @path: validation.py
+import numpy as np, onnx, onnxruntime as ort, librosa, argparse
+from onnx import helper, TensorProto
+SR,N_FFT,HOP,N_MELS,FRAMES=16000,512,256,96,187
+def mel(p):
+    y,_=librosa.load(p,sr=SR,mono=True)
+    m=librosa.power_to_db(
+        librosa.feature.melspectrogram(y=y,sr=SR,n_fft=N_FFT,hop_length=HOP,n_mels=N_MELS),
+        ref=np.max
+    ).T.astype(np.float32)
+    return m[:FRAMES] if len(m)>=FRAMES else np.pad(
+        m,((0,FRAMES-len(m)),(0,0)),'constant',
+        constant_values=(m.min() if len(m) else -80)
     )
-
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_db = mel_db.T.astype(np.float32)
-
-    T = mel_db.shape[0]
-
-    if T >= FRAMES:
-        mel_db = mel_db[:FRAMES, :]
-    else:
-        pad_rows = FRAMES - T
-        pad_value = mel_db.min() if T > 0 else -80.0
-        mel_db = np.vstack([
-            mel_db,
-            np.full((pad_rows, N_MELS), pad_value, dtype=np.float32)
-        ])
-
-    return mel_db
-
-
-# =====================
-# PYTHON FLOAT PIPELINE
-# =====================
-def python_pipeline(mel):
-    enc_sess = ort.InferenceSession(ENCODER, providers=["CPUExecutionProvider"])
-    head_sess = ort.InferenceSession(HEAD, providers=["CPUExecutionProvider"])
-
-    enc_input = enc_sess.get_inputs()[0].name
-    head_input = head_sess.get_inputs()[0].name
-
-    emb = enc_sess.run(
-        None,
-        {enc_input: mel[np.newaxis, :, :]}
-    )[0]
-
-    emb_mean = np.load(EMB_MEAN)
-    emb_std = np.load(EMB_STD)
-    emb_std = np.where(emb_std < 1e-8, 1.0, emb_std)
-
-    emb_stdized = (emb - emb_mean) / emb_std
-
-    raw = head_sess.run(
-        None,
-        {head_input: emb_stdized.astype(np.float32)}
-    )[0][0]
-
-    final = np.tanh(raw)
-
-    return final
-
-
-# =====================
-# MERGED PIPELINE
-# =====================
-def merged_pipeline(mel):
-    sess = ort.InferenceSession(MERGED, providers=["CPUExecutionProvider"])
-    input_name = sess.get_inputs()[0].name
-
-    out = sess.run(
-        None,
-        {input_name: mel[np.newaxis, :, :]}
-    )[0][0]
-
-    return out
-
-
-# =====================
-# MAIN
-# =====================
-if __name__ == "__main__":
-    mel = make_mel(AUDIO_PATH)
-
-    py_out = python_pipeline(mel)
-    merged_out = merged_pipeline(mel)
-
-    print("Python reference:", py_out)
-    print("Merged model   :", merged_out)
-
-    diff = np.abs(py_out - merged_out)
-    print("Absolute diff  :", diff)
-    print("Max diff       :", diff.max())
+def run(s,x): return s.run(None,{s.get_inputs()[0].name:x})[0]
+def run1(p,x):
+    s=ort.InferenceSession(p,providers=["CPUExecutionProvider"])
+    return run(s,x[None])[0]
+def add_dbg(i,o):
+    m=onnx.load(i); n=m.graph.node
+    t=[x for x in n if x.op_type=="Tanh"]
+    hr=(t[-1].input[0] if t else n[-1].output[0])
+    outs={y for x in n for y in x.output}
+    es=next((x for x in ("emb_stdized","emb_sub","emb_std","head_input") if x in outs),None)
+    ex={x.name for x in m.graph.output}
+    for x in (es,hr):
+        if x and x not in ex:
+            m.graph.output.append(helper.make_tensor_value_info(x,TensorProto.FLOAT,None))
+    onnx.save(m,o)
+    return es,hr
+def ref(x,e,h,m,s):
+    e,h=ort.InferenceSession(e),ort.InferenceSession(h)
+    z=(run(e,x)[0]-m)/np.maximum(s,1e-8)
+    r=run(h,z.astype(np.float32))[0]
+    return z,r,np.tanh(r)
+def run_all(p,x):
+    s=ort.InferenceSession(p)
+    o=s.run(None,{s.get_inputs()[0].name:x})
+    return dict(zip([i.name for i in s.get_outputs()],o))
+def main():
+    p=argparse.ArgumentParser()
+    p.add_argument("--audio",default="test.wav")
+    p.add_argument("--enc",default="msd_musicnn.onnx")
+    p.add_argument("--head",default="deam_head.onnx")
+    p.add_argument("--merged",required=True)
+    p.add_argument("--debug_out",default="merged_debug.onnx")
+    p.add_argument("--mean",default="emb_mean.npy")
+    p.add_argument("--std",default="emb_std.npy")
+    a=p.parse_args()
+    M,S=np.load(a.mean),np.load(a.std)
+    x=mel(a.audio)[None]
+    z,r,py=ref(x,a.enc,a.head,M,S)
+    mg=run(ort.InferenceSession(a.merged),x)[0]
+    d=np.abs(py-mg)
+    print("Python:",py)
+    print("Merged:",mg)
+    print("Diff:",d,"Max:",d.max())
+    es,hr=add_dbg(a.merged,a.debug_out)
+    r=run_all(a.debug_out,x)
+    print("\nDebug:",list(r))
+    if es in r: print("z:",r[es].mean(),r[es].std())
+    if hr in r: print("raw:",r[hr].ravel()[:10])
+    if "final_output" in r: print("final:",r["final_output"])
+    print("\nMerged-only:",run1(a.merged,mel(a.audio)))
+if __name__=="__main__": main()

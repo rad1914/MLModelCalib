@@ -1,32 +1,11 @@
 #!/usr/bin/env python3
-# fix_opset.py
-import onnx
-import sys
-
-if len(sys.argv) != 3:
-    print("Usage: fix_opset.py input.onnx output.onnx")
-    sys.exit(1)
-
-inp = sys.argv[1]
-out = sys.argv[2]
-
-model = onnx.load(inp)
-
-unique = {}
-for oi in model.opset_import:
-    domain = oi.domain or ""
-    unique[domain] = oi.version
-
-del model.opset_import[:]
-
-for domain, version in unique.items():
-    new_oi = model.opset_import.add()
-    new_oi.domain = domain
-    new_oi.version = version
-
-onnx.save(model, out)
-
-print("Saved fixed model:", out)
-print("Opsets:")
-for oi in model.opset_import:
-    print(" domain:", repr(oi.domain), "version:", oi.version)
+# @path: fix_opset.py
+import onnx,sys
+if len(sys.argv)!=3:exit("Usage: fix_opset.py in.onnx out.onnx")
+m=onnx.load(sys.argv[1])
+u={(o.domain or ""):o.version for o in m.opset_import}
+m.opset_import.clear()
+for d,v in u.items():
+    x=m.opset_import.add();x.domain=d;x.version=v
+onnx.save(m,sys.argv[2])
+print("Saved:",sys.argv[2],"\nOpsets:",[(o.domain,o.version) for o in m.opset_import])
