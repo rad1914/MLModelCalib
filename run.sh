@@ -42,6 +42,10 @@ download_if_missing \
   "https://essentia.upf.edu/models/classification-heads/deam/deam-msd-musicnn-2.json" \
   "deam_head.json"
 echo "[1/6] Compute encoder calibration stats"
+if [[ -s "$MEAN" && -s "$STD" ]]; then
+  echo "  ↳ removing stale calibration stats (dimension mismatch)"
+  rm -f "$MEAN" "$STD"
+fi
 echo "Running compute_calib_stats.py..."
 "$PYTHON" "$SCRIPT_DIR/compute_calib_stats.py" \
   -m "$ENC" \
