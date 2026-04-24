@@ -3,10 +3,8 @@
 import os, sys, argparse, numpy as np, onnxruntime as ort
 import onnx
 from audio_utils import load_audio_mono, make_mel_patch
-
 def dims(v):
     return [d.dim_value if d.dim_value else None for d in v.type.tensor_type.shape.dim]
-
 def pick_tensor(m, want=200):
     m = onnx.shape_inference.infer_shapes(m)
     for vi in list(m.graph.value_info) + list(m.graph.output):
@@ -14,7 +12,6 @@ def pick_tensor(m, want=200):
         if shp and shp[-1] == want:
             return vi.name
     raise SystemExit(f"no {want}-d tensor found in encoder")
-
 p = argparse.ArgumentParser()
 p.add_argument("-m","--model",default="msd_musicnn.onnx")
 p.add_argument("-c","--calib",default="calib_wavs")
@@ -23,7 +20,6 @@ p.add_argument("--out-std",default="emb_std.npy")
 a = p.parse_args()
 os.path.isfile(a.model) or sys.exit(f"Missing model: {a.model}")
 os.path.isdir(a.calib) or sys.exit(f"Missing calib dir: {a.calib}")
-
 enc = onnx.load(a.model)
 tensor_name = pick_tensor(enc, 200)
 tmp_model = a.model + ".calibdbg.onnx"
@@ -36,11 +32,9 @@ if tensor_name not in {o.name for o in enc.graph.output}:
 else:
     s = ort.InferenceSession(a.model, providers=["CPUExecutionProvider"])
 i = s.get_inputs()[0]
-
 def prep(x):
     x = x.astype(np.float32)
     return x[None, ..., None] if len(i.shape) == 4 else x[None]
-
 done_f = os.path.join(a.calib, "_processed.txt")
 done = set(open(done_f).read().split()) if os.path.isfile(done_f) else set()
 E = []

@@ -2,15 +2,30 @@
 import sys, onnx, numpy as np
 from onnx import helper, numpy_helper as nh
 from onnx.compose import merge_models, add_prefix
+def dims(v):
+    return [d.dim_value if d.dim_value else None for d in v.type.tensor_type.shape.dim]
+def pick_tensor(m, want=200):
+    m = onnx.shape_inference.infer_shapes(m)
+    for vi in list(m.graph.value_info) + list(m.graph.output):
+        shp = dims(vi)
+        if shp and shp[-1] == want:
+            return vi.name
+    raise SystemExit(f"no {want}-d tensor found in encoder")
 a = sys.argv
 if len(a) < 6: sys.exit("Usage: merge_and_stitch.py ENC HEAD MEAN STD OUT [--prefix p] [--tanh]")
 p = a[a.index("--prefix")+1] if "--prefix" in a else "h_"
 enc = onnx.load(a[1])
 head = add_prefix(onnx.load(a[2]), p)
-m = merge_models(enc, head, io_map=[(enc.graph.output[0].name, head.graph.input[0].name)])
+eo = pick_tensor(enc, 200)
+hi = next(i.name for i in head.graph.input if dims(i)[-1] == 200)
+enc_outs = {o.name for o in enc.graph.output}
+if eo not in enc_outs:
+    from onnx import helper, TensorProto
+    enc.graph.output.append(
+        helper.make_tensor_value_info(eo, TensorProto.FLOAT, None)
+    )
+m = merge_models(enc, head, io_map=[(eo, hi)])
 g = m.graph
-eo = enc.graph.output[0].name
-hi = head.graph.input[0].name
 g.initializer.extend([
     nh.from_array(np.load(a[3]).astype(np.float32), "mean"),
     nh.from_array(np.load(a[4]).astype(np.float32), "std"),
@@ -49,6 +64,15 @@ print("Saved:",sys.argv[2],"\nOpsets:",[(o.domain,o.version) for o in m.opset_im
 import numpy as np, onnx, onnxruntime as ort, librosa, argparse
 from onnx import helper, TensorProto
 SR, N_FFT, HOP, N_MELS, FRAMES = 16000, 512, 256, 96, 187
+def dims(v):
+    return [d.dim_value if d.dim_value else None for d in v.type.tensor_type.shape.dim]
+def pick_tensor(m, want=200):
+    m = onnx.shape_inference.infer_shapes(m)
+    for vi in list(m.graph.value_info) + list(m.graph.output):
+        shp = dims(vi)
+        if shp and shp[-1] == want:
+            return vi.name
+    raise SystemExit(f"no {want}-d tensor found in encoder")
 def mel(p):
     y,_ = librosa.load(p, sr=SR, mono=True)
     m = librosa.power_to_db(librosa.feature.melspectrogram(
@@ -57,9 +81,23 @@ def mel(p):
     return m[:FRAMES] if len(m)>=FRAMES else np.pad(
         m, ((0,FRAMES-len(m)),(0,0)), constant_values=(m.min() if len(m) else -80)
     )
-def run(p, x):
+def run(p, x, out_name=None):
     s = ort.InferenceSession(p)
-    return s.run(None, {s.get_inputs()[0].name: x})[0]
+    outs = None if out_name is None else [out_name]
+    return s.run(outs, {s.get_inputs()[0].name: x})[0]
+def pick_out_2d(model_path):
+    s = ort.InferenceSession(model_path)
+    for o in s.get_outputs():
+        shp = list(o.shape)
+        if shp and shp[-1] == 2:
+            return o.name
+    return s.get_outputs()[-1].name
+def expose_tensor(model_path, out_path, tensor_name):
+    m = onnx.shape_inference.infer_shapes(onnx.load(model_path))
+    if tensor_name not in {o.name for o in m.graph.output}:
+        vi = next(v for v in list(m.graph.value_info) if v.name == tensor_name)
+        m.graph.output.append(vi)
+    onnx.save(m, out_path)
 def add_dbg(i, o):
     m = onnx.load(i)
     n = m.graph.node
@@ -82,13 +120,30 @@ def main():
     a.add_argument("--mean", default="emb_mean.npy")
     a.add_argument("--std", default="emb_std.npy")
     a = a.parse_args()
+    
     x = mel(a.audio)[None]
     M, S = np.load(a.mean), np.load(a.std)
-    z = (run(a.enc, x) - M) / np.maximum(S, 1e-8)
+    
+    enc_name = pick_tensor(onnx.load(a.enc), 200)
+    tmp_enc = a.enc + ".dbg.onnx"
+    expose_tensor(a.enc, tmp_enc, enc_name)
+    enc_out = run(tmp_enc, x, enc_name)
+    
+    d = enc_out.shape[-1]
+    print("enc_shape:", enc_out.shape, "mean_shape:", M.shape, "std_shape:", S.shape)
+    assert M.shape == S.shape == (d,), (M.shape, S.shape, d)
+    
+    z = (enc_out - M) / np.maximum(S, 1e-8)
+    assert z.shape[-1] == d, z.shape
+    
     r = run(a.head, z.astype(np.float32))[0]
     py = np.tanh(r)
-    mg = run(a.merged, x)[0]
+    
+    merged_out = pick_out_2d(a.merged)
+    mg = run(a.merged, x, merged_out)[0]
+    
     print("Diff max:", np.abs(py - mg).max())
+    
     es, hr = add_dbg(a.merged, a.debug_out)
     dbg = run(a.debug_out, x)
     print("Debug keys:", len(dbg), es, hr)
@@ -218,7 +273,17 @@ print("Saved:", sys.argv[2])
 #!/usr/bin/env python3
 # @path: compute_calib_stats.py
 import os, sys, argparse, numpy as np, onnxruntime as ort
+import onnx
 from audio_utils import load_audio_mono, make_mel_patch
+def dims(v):
+    return [d.dim_value if d.dim_value else None for d in v.type.tensor_type.shape.dim]
+def pick_tensor(m, want=200):
+    m = onnx.shape_inference.infer_shapes(m)
+    for vi in list(m.graph.value_info) + list(m.graph.output):
+        shp = dims(vi)
+        if shp and shp[-1] == want:
+            return vi.name
+    raise SystemExit(f"no {want}-d tensor found in encoder")
 p = argparse.ArgumentParser()
 p.add_argument("-m","--model",default="msd_musicnn.onnx")
 p.add_argument("-c","--calib",default="calib_wavs")
@@ -227,16 +292,29 @@ p.add_argument("--out-std",default="emb_std.npy")
 a = p.parse_args()
 os.path.isfile(a.model) or sys.exit(f"Missing model: {a.model}")
 os.path.isdir(a.calib) or sys.exit(f"Missing calib dir: {a.calib}")
-s = ort.InferenceSession(a.model, providers=["CPUExecutionProvider"])
+enc = onnx.load(a.model)
+tensor_name = pick_tensor(enc, 200)
+tmp_model = a.model + ".calibdbg.onnx"
+if tensor_name not in {o.name for o in enc.graph.output}:
+    vi = onnx.shape_inference.infer_shapes(enc)
+    vi = next(v for v in list(vi.graph.value_info) if v.name == tensor_name)
+    enc.graph.output.append(vi)
+    onnx.save(enc, tmp_model)
+    s = ort.InferenceSession(tmp_model, providers=["CPUExecutionProvider"])
+else:
+    s = ort.InferenceSession(a.model, providers=["CPUExecutionProvider"])
 i = s.get_inputs()[0]
-prep = lambda x: x.astype(np.float32)[None]*(1 if len(i.shape)!=4 else 1) if len(i.shape)!=4 else x.astype(np.float32)[None,None]
+def prep(x):
+    x = x.astype(np.float32)
+    return x[None, ..., None] if len(i.shape) == 4 else x[None]
 done_f = os.path.join(a.calib, "_processed.txt")
 done = set(open(done_f).read().split()) if os.path.isfile(done_f) else set()
 E = []
 for f in sorted(x for x in os.listdir(a.calib) if x.lower().endswith(".wav") and x not in done):
     try:
         x = make_mel_patch(load_audio_mono(os.path.join(a.calib,f)))
-        E.append(s.run(None, {i.name: prep(x)})[0].ravel())
+        e = s.run([tensor_name], {i.name: prep(x)})[0].ravel().astype(np.float32)
+        E.append(e)
         open(done_f,"a").write(f+"\n")
     except Exception as e:
         print(f"[skip] {f}: {e}", file=sys.stderr)
@@ -245,3 +323,5 @@ E = np.stack(E).astype(np.float32)
 std = E.std(0); std[std<1e-6]=1.0
 np.save(a.out_mean, E.mean(0))
 np.save(a.out_std, std)
+print("Saved:", a.out_mean, E.mean(0).shape)
+print("Saved:", a.out_std, std.shape)

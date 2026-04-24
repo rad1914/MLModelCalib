@@ -43,15 +43,15 @@ download_if_missing \
   "deam_head.json"
 echo "[1/6] Compute encoder calibration stats"
 if [[ -s "$MEAN" && -s "$STD" ]]; then
-  echo "  ↳ removing stale calibration stats (dimension mismatch)"
-  rm -f "$MEAN" "$STD"
+  echo "  ↳ skip: calibration stats exist"
+else
+  echo "Running compute_calib_stats.py..."
+  "$PYTHON" "$SCRIPT_DIR/compute_calib_stats.py" \
+    -m "$ENC" \
+    -c "$CALIB_DIR" \
+    --out-mean "$MEAN" \
+    --out-std "$STD" || { echo "[FAIL] calibration step"; exit 1; }
 fi
-echo "Running compute_calib_stats.py..."
-"$PYTHON" "$SCRIPT_DIR/compute_calib_stats.py" \
-  -m "$ENC" \
-  -c "$CALIB_DIR" \
-  --out-mean "$MEAN" \
-  --out-std "$STD" || { echo "[FAIL] calibration step"; exit 1; }
 echo "[2/5] Merge encoder + standardized head"
 MERGE_ARGS=("$ENC" "$HEAD" "$MEAN" "$STD" "$MERGED" "--prefix" "$PREFIX")
 if [[ "$TANH" != "0" && "$TANH" != "false" && "$TANH" != "False" ]]; then
@@ -60,22 +60,22 @@ fi
 "$PYTHON" "$SCRIPT_DIR/merging.py" "${MERGE_ARGS[@]}" || { echo "[FAIL] merge"; exit 1; }
 echo "[3/5] Normalize opset imports"
 "$PYTHON" "$SCRIPT_DIR/fix_opset.py" "$MERGED" "$MERGED_FIX" || { echo "[FAIL] opset fix"; exit 1; }
-echo "[4/5] Quantize merged model"
-"$PYTHON" "$SCRIPT_DIR/quantize_model.py" \
-  "$MERGED_FIX" \
-  "$MERGED_Q" \
-  "$CALIB_DIR" || { echo "[FAIL] quantization"; exit 1; }
-echo "[5/5] Validate quantized merged model"
+echo "[4/5] Validate merged model"
 "$PYTHON" "$SCRIPT_DIR/validation.py" \
   --audio "$AUDIO" \
   --enc "$ENC" \
   --head "$HEAD" \
-  --merged "$MERGED_Q" \
+  --merged "$MERGED_FIX" \
   --debug_out "$DEBUG" \
   --mean "$MEAN" \
   --std "$STD" || { echo "[FAIL] validation"; exit 1; }
+echo "[5/5] Quantize merged model"
+"$PYTHON" "$SCRIPT_DIR/quantize_model.py" \
+  "$MERGED_FIX" \
+  "$MERGED_Q" \
+  "$CALIB_DIR" || { echo "[FAIL] quantization"; exit 1; }
 echo "Done"
-echo "Mean:   $MEAN"
-echo "Std:    $STD"
+echo "Mean: $MEAN"
+echo "Std: $STD"
 echo "Merged: $MERGED_Q"
-echo "Debug:  $DEBUG"
+echo "Debug: $DEBUG"

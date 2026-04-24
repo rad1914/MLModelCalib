@@ -2,12 +2,9 @@
 # @path: validation.py
 import numpy as np, onnx, onnxruntime as ort, librosa, argparse
 from onnx import helper, TensorProto
-
 SR, N_FFT, HOP, N_MELS, FRAMES = 16000, 512, 256, 96, 187
-
 def dims(v):
     return [d.dim_value if d.dim_value else None for d in v.type.tensor_type.shape.dim]
-
 def pick_tensor(m, want=200):
     m = onnx.shape_inference.infer_shapes(m)
     for vi in list(m.graph.value_info) + list(m.graph.output):
@@ -15,7 +12,6 @@ def pick_tensor(m, want=200):
         if shp and shp[-1] == want:
             return vi.name
     raise SystemExit(f"no {want}-d tensor found in encoder")
-
 def mel(p):
     y,_ = librosa.load(p, sr=SR, mono=True)
     m = librosa.power_to_db(librosa.feature.melspectrogram(
@@ -24,12 +20,10 @@ def mel(p):
     return m[:FRAMES] if len(m)>=FRAMES else np.pad(
         m, ((0,FRAMES-len(m)),(0,0)), constant_values=(m.min() if len(m) else -80)
     )
-
 def run(p, x, out_name=None):
     s = ort.InferenceSession(p)
     outs = None if out_name is None else [out_name]
     return s.run(outs, {s.get_inputs()[0].name: x})[0]
-
 def pick_out_2d(model_path):
     s = ort.InferenceSession(model_path)
     for o in s.get_outputs():
@@ -37,27 +31,25 @@ def pick_out_2d(model_path):
         if shp and shp[-1] == 2:
             return o.name
     return s.get_outputs()[-1].name
-
 def expose_tensor(model_path, out_path, tensor_name):
     m = onnx.shape_inference.infer_shapes(onnx.load(model_path))
     if tensor_name not in {o.name for o in m.graph.output}:
         vi = next(v for v in list(m.graph.value_info) if v.name == tensor_name)
         m.graph.output.append(vi)
     onnx.save(m, out_path)
-
 def add_dbg(i, o):
     m = onnx.load(i)
     n = m.graph.node
-    hr = next((x.input[0] for x in reversed(n) if x.op_type=="Tanh"), n[-1].output[0])
-    outs = {y for x in n for y in x.output}
-    es = next((x for x in ("emb_stdized","emb_sub","emb_std","head_input") if x in outs), None)
+    sub = next((x.output[0] for x in n if x.op_type == "Sub" and x.output), None)
+    div = next((x.output[0] for x in n if x.op_type == "Div" and x.output), None)
+    pre = next((x.input[0] for x in reversed(n) if x.op_type == "Tanh" and x.input), None)
+    hr = pre or (n[-1].output[0] if n and n[-1].output else None)
     ex = {x.name for x in m.graph.output}
-    for x in (es, hr):
+    for x in (sub, div, hr):
         if x and x not in ex:
             m.graph.output.append(helper.make_tensor_value_info(x, TensorProto.FLOAT, None))
     onnx.save(m, o)
-    return es, hr
-
+    return sub, div, hr
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("--audio", default="test.wav")
@@ -92,8 +84,7 @@ def main():
     
     print("Diff max:", np.abs(py - mg).max())
     
-    es, hr = add_dbg(a.merged, a.debug_out)
+    sub, div, hr = add_dbg(a.merged, a.debug_out)
     dbg = run(a.debug_out, x)
-    print("Debug keys:", len(dbg), es, hr)
-
+    print("Debug keys:", len(dbg), sub, div, hr)
 if __name__ == "__main__": main()
