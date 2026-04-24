@@ -183,7 +183,7 @@ from onnxruntime.quantization import (
      CalibrationMethod
 )
 class AudioCalibReader(CalibrationDataReader):
-    MAX_CALIB_FILES = 120
+    MAX_CALIB_FILES = 60
     def __init__(self, calib_dir, model_path):
         import onnxruntime as ort
         self.idx    = 0
@@ -241,6 +241,7 @@ def main():
         per_channel=False,
         reduce_range=False,
         calibrate_method=CalibrationMethod.Entropy,
+        op_types_to_quantize=["MatMul", "Gemm"],
     )
     print("Saved:", out)
 if __name__ == "__main__":
