@@ -52,15 +52,15 @@ else
     --out-mean "$MEAN" \
     --out-std "$STD" || { echo "[FAIL] calibration step"; exit 1; }
 fi
-echo "[2/5] Merge encoder + standardized head"
+echo "[2/6] Merge encoder + standardized head"
 MERGE_ARGS=("$ENC" "$HEAD" "$MEAN" "$STD" "$MERGED" "--prefix" "$PREFIX")
 if [[ "$TANH" != "0" && "$TANH" != "false" && "$TANH" != "False" ]]; then
   MERGE_ARGS+=("--tanh")
 fi
 "$PYTHON" "$SCRIPT_DIR/merging.py" "${MERGE_ARGS[@]}" || { echo "[FAIL] merge"; exit 1; }
-echo "[3/5] Normalize opset imports"
+echo "[3/6] Normalize opset imports"
 "$PYTHON" "$SCRIPT_DIR/fix_opset.py" "$MERGED" "$MERGED_FIX" || { echo "[FAIL] opset fix"; exit 1; }
-echo "[4/5] Validate merged model"
+echo "[4/6] Validate merged model"
 "$PYTHON" "$SCRIPT_DIR/validation.py" \
   --audio "$AUDIO" \
   --enc "$ENC" \
@@ -69,11 +69,16 @@ echo "[4/5] Validate merged model"
   --debug_out "$DEBUG" \
   --mean "$MEAN" \
   --std "$STD" || { echo "[FAIL] validation"; exit 1; }
-echo "[5/5] Quantize merged model"
-"$PYTHON" "$SCRIPT_DIR/quantize_model.py" \
+echo "[5/6] Quantize merged model (QDQ static)"
+"$PYTHON" "$SCRIPT_DIR/quantize_qdq_final.py" \
+  "$MERGED_FIX" \
+  "$CALIB_DIR" \
+  "$MERGED_Q" || { echo "[FAIL] quantization"; exit 1; }
+echo "[6/6] Validate quantized model (multi-sample)"
+"$PYTHON" "$SCRIPT_DIR/verify_quant_final.py" \
   "$MERGED_FIX" \
   "$MERGED_Q" \
-  "$CALIB_DIR" || { echo "[FAIL] quantization"; exit 1; }
+  "$CALIB_DIR" || { echo "[FAIL] validation"; exit 1; }
 echo "Done"
 echo "Mean: $MEAN"
 echo "Std: $STD"

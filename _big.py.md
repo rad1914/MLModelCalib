@@ -174,6 +174,77 @@ for i,f in enumerate(glob.glob(d+"/*.wav")):
     e=s.run(None,{inp:mel(f)[None]})[0].squeeze().astype('float32')
     np.save(f"head_calib/calib_{i:04d}.npy",(e-mean)/std)
 print("Saved",i+1)
+# @path: quantize_qdq_final.py
+import sys, os, numpy as np
+import soundfile as sf
+from onnxruntime.quantization import (
+     quantize_static, CalibrationDataReader,
+     QuantFormat, QuantType,
+     CalibrationMethod
+)
+class AudioCalibReader(CalibrationDataReader):
+    MAX_CALIB_FILES = 120
+    def __init__(self, calib_dir, model_path):
+        import onnxruntime as ort
+        self.idx    = 0
+        _sess = ort.InferenceSession(model_path,
+                                     providers=["CPUExecutionProvider"])
+        self.input_name = _sess.get_inputs()[0].name
+        all_files = sorted(
+            os.path.join(calib_dir, f)
+            for f in os.listdir(calib_dir) if f.endswith(".wav")
+        )
+        files = all_files[: self.MAX_CALIB_FILES]
+        if not files:
+            raise RuntimeError(f"No .wav files found in {calib_dir}")
+        print(f"  ↳ streaming {len(files)} / {len(all_files)} mel patches ...")
+        self.files = files
+    def rewind(self):
+        self.idx = 0
+    @staticmethod
+    def _mel(f, SR=16000, N_FFT=512, HOP=256, N_MELS=96, FRAMES=187):
+        import librosa
+        y, sr = sf.read(f, dtype="float32", always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        if sr != SR:
+            y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+        m = librosa.power_to_db(librosa.feature.melspectrogram(
+            y=y, sr=SR, n_fft=N_FFT, hop_length=HOP, n_mels=N_MELS
+        ), ref=np.max).T.astype(np.float32)
+        if len(m) < FRAMES:
+            m = np.pad(m, ((0, FRAMES - len(m)), (0, 0)), constant_values=m.min())
+        return m[:FRAMES][None]
+    def get_next(self):
+        if self.idx >= len(self.files):
+            return None
+        f = self.files[self.idx]
+        item = {self.input_name: self._mel(f)}
+        self.idx += 1
+        return item
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: quantize_qdq_final.py fp32.onnx calib_dir out.onnx")
+        sys.exit(1)
+    fp32, calib_dir, out = sys.argv[1:]
+    reader = AudioCalibReader(calib_dir, fp32)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    quantize_static(
+        model_input=fp32,
+        model_output=out,
+        calibration_data_reader=reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+        per_channel=False,
+        reduce_range=False,
+        calibrate_method=CalibrationMethod.Entropy,
+    )
+    print("Saved:", out)
+if __name__ == "__main__":
+    main()
 # @path: audio_utils.py
 import numpy as np, librosa
 def load_audio_mono(p, sr=16000):
@@ -264,17 +335,193 @@ if mean.size!=emb.size or std.size!=emb.size: sys.exit("mean/std size mismatch")
 emb=(emb-mean)/(std+1e-12)
 out=run(ort.InferenceSession(a.head,providers=["CPUExecutionProvider"]),emb)
 print(json.dumps({"output":act[a.activation](out)[0].tolist()}))
-#!/usr/bin/env python3
+# @path: verify_quant_final.py
+import sys, os, numpy as np, librosa, onnxruntime as ort, math
+from scipy.stats import pearsonr
+SR,N_FFT,HOP,N_MELS,FRAMES = 16000,512,256,96,187
+def mel(f):
+    y,_ = librosa.load(f, sr=SR, mono=True)
+    m = librosa.power_to_db(librosa.feature.melspectrogram(
+        y=y, sr=SR, n_fft=N_FFT, hop_length=HOP, n_mels=N_MELS
+    ), ref=np.max).T.astype(np.float32)
+    return m[:FRAMES] if len(m)>=FRAMES else np.pad(
+        m, ((0,FRAMES-len(m)),(0,0)), constant_values=m.min()
+    )
+def run(sess, x):
+    return sess.run(None, {sess.get_inputs()[0].name: x})[0][0]
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: verify_quant_final.py fp32.onnx qdq.onnx wav_dir")
+        sys.exit(1)
+    fp32, qdq, wav_dir = sys.argv[1:]
+    s_fp32 = ort.InferenceSession(fp32)
+    s_qdq  = ort.InferenceSession(qdq)
+    files = [os.path.join(wav_dir,f) for f in os.listdir(wav_dir) if f.endswith(".wav")]
+    if len(files) < 10:
+        raise RuntimeError("Need at least 10 samples (not 1).")
+    fp32_out, qdq_out = [], []
+    for f in files:
+        x = mel(f)[None]
+        fp32_out.append(run(s_fp32, x))
+        qdq_out.append(run(s_qdq, x))
+    fp32_out = np.array(fp32_out)
+    qdq_out  = np.array(qdq_out)
+    failed = False
+    for i, name in enumerate(["valence","arousal"]):
+        corr,_ = pearsonr(fp32_out[:,i], qdq_out[:,i])
+        diff = np.abs(fp32_out[:,i] - qdq_out[:,i])
+        print(name)
+        print("  Pearson:", corr)
+        print("  Max diff:", diff.max())
+        print("  Mean diff:", diff.mean())
+        if math.isnan(corr) or corr < 0.92:
+            print(f"  [FAIL] {name} Pearson {corr:.4f} < 0.92 threshold")
+            failed = True
+    if failed:
+        sys.exit(1)
+    print("PASS: quantization acceptable (Pearson >= 0.92 for all outputs)")
+if __name__ == "__main__":
+    main()
 # @path: quantize_model.py
-import sys, onnx
+import sys
+import os
+import numpy as np
+import onnx
+import onnxruntime as ort
+import librosa
 from onnxruntime.quantization import quantize_dynamic, QuantType
-quantize_dynamic(
-    sys.argv[1], sys.argv[2],
-    weight_type=QuantType.QInt8,
-    op_types_to_quantize=["MatMul","Gemm"],
-    extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT},
-)
-print("Saved:", sys.argv[2])
+SR = 16000
+N_FFT = 512
+HOP = 256
+N_MELS = 96
+FRAMES = 187
+def quantize_model(fp32_path, qdq_path):
+    quantize_dynamic(
+        fp32_path,
+        qdq_path,
+        weight_type=QuantType.QInt8,
+        op_types_to_quantize=["MatMul", "Gemm"],
+        reduce_range=True,
+        extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT},
+    )
+    print("Saved:", qdq_path)
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python script.py model_fp32.onnx model_qdq.onnx")
+        sys.exit(1)
+    fp32_path = sys.argv[1]
+    qdq_path  = sys.argv[2]
+    global mean, std
+    if os.path.exists("emb_mean.npy") and os.path.exists("emb_std.npy"):
+        mean = np.load("emb_mean.npy").astype(np.float32)
+        std  = np.load("emb_std.npy").astype(np.float32)
+    
+    quantize_model(fp32_path, qdq_path)
+    wav_dir = "test_wavs"
+    if not os.path.isdir(wav_dir):
+        print(f"[WARN] Missing '{wav_dir}/' → skipping validation")
+        return
+    files = list_wavs(wav_dir)
+    if not files:
+        print(f"[WARN] No WAV files in '{wav_dir}/' → skipping validation")
+        return
+    fp32_sess = load_session(fp32_path)
+    qdq_sess  = load_session(qdq_path)
+    results_fp32 = []
+    results_qdq  = []
+    for f in files:
+        x = preprocess_audio(f)
+        y_fp32 = run(fp32_sess, x)
+        y_qdq  = run(qdq_sess, x)
+        results_fp32.append(y_fp32)
+        results_qdq.append(y_qdq)
+    metrics = compute_metrics(results_fp32, results_qdq)
+    print_report(metrics)
+def list_wavs(dir_path):
+    return [
+        os.path.join(dir_path, f)
+        for f in sorted(os.listdir(dir_path))
+        if f.lower().endswith(".wav")
+    ]
+def load_session(path):
+    return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+def preprocess_audio(path):
+    y, _ = librosa.load(path, sr=SR, mono=True)
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=SR,
+        n_fft=N_FFT,
+        hop_length=HOP,
+        n_mels=N_MELS
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    mel_t = mel_db.T.astype(np.float32)
+    if mel_t.shape[0] >= FRAMES:
+        mel_fixed = mel_t[:FRAMES]
+    else:
+        pad = np.full(
+            (FRAMES - mel_t.shape[0], N_MELS),
+            mel_t.min() if mel_t.size else -80.0,
+            dtype=np.float32
+        )
+        mel_fixed = np.vstack((mel_t, pad))
+    return mel_fixed[None, :, :]
+def run(session, x):
+    inp = session.get_inputs()[0]
+    name = inp.name
+    if len(inp.shape) >= 3 and inp.shape[2] == x.shape[1]:
+        x = x.transpose(0, 2, 1)
+    out = session.run(None, {name: x.astype(np.float32)})[0]
+    if "mean" in globals() and "std" in globals():
+        if out.shape[-1] == mean.shape[0]:
+            out = (out - mean) / np.maximum(std, 1e-8)
+    return out
+def compute_metrics(A, B):
+    A = np.vstack(A)
+    B = np.vstack(B)
+    diff = np.abs(A - B)
+    max_diff  = diff.max()
+    mean_diff = diff.mean()
+    corr_0 = pearson(A[:, 0], B[:, 0])
+    corr_1 = pearson(A[:, 1], B[:, 1])
+    return {
+        "max_diff": float(max_diff),
+        "mean_diff": float(mean_diff),
+        "pearson_valence": float(corr_0),
+        "pearson_arousal": float(corr_1),
+        "n_samples": len(A),
+    }
+def pearson(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if len(x) < 2:
+        return float("nan")
+    xm = x - x.mean()
+    ym = y - y.mean()
+    denom = np.sqrt((xm**2).sum() * (ym**2).sum())
+    if denom < 1e-12:
+        return 0.0
+    return float((xm * ym).sum() / denom)
+def print_report(m):
+    print("Max diff:", m["max_diff"])
+    print("Mean diff:", m["mean_diff"])
+    corr_v = m["pearson_valence"]
+    corr_a = m["pearson_arousal"]
+    n      = m.get("n_samples", "?")
+    print("Corr valence:", corr_v)
+    print("Corr arousal:", corr_a)
+    if np.isnan(corr_v) or np.isnan(corr_a):
+        print(f"[WARN] Pearson undefined (n_samples={n}); using diff-based check.")
+        if m["max_diff"] <= 0.01 and m["mean_diff"] <= 0.001:
+            print("PASS: quantization acceptable (diff-based)")
+        else:
+            print("FAIL: quantization degraded model (diff-based)")
+    elif corr_v < 0.92 or corr_a < 0.92:
+        print("FAIL: quantization degraded model")
+    else:
+        print("PASS: quantization acceptable")
+if __name__ == "__main__":
+    main()
 #!/usr/bin/env python3
 # @path: compute_calib_stats.py
 import os, sys, argparse, numpy as np, onnxruntime as ort
