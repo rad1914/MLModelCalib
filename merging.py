@@ -31,14 +31,14 @@ g.initializer.extend([
     nh.from_array(np.load(a[4]).astype(np.float32), "std"),
 ])
 sub, div = eo+"_sub", eo+"_div"
-i = next((i for i,n in enumerate(g.node) if hi in n.input), len(g.node))
+i = next((i for i,n in enumerate(g.node) if eo in n.input), len(g.node))
 n1 = helper.make_node("Sub", [eo, "mean"], [sub])
 n2 = helper.make_node("Div", [sub, "std"], [div])
 g.node.insert(i, n1)
 g.node.insert(i+1, n2)
 for n in g.node:
     if sub in n.output or div in n.output: continue
-    n.input[:] = [div if x == hi else x for x in n.input]
+    n.input[:] = [div if x == eo else x for x in n.input]
 if "--tanh" in a:
     o = g.output[0].name
     t = o+"_t"

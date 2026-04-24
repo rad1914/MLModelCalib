@@ -31,7 +31,7 @@ g.initializer.extend([
     nh.from_array(np.load(a[4]).astype(np.float32), "std"),
 ])
 sub, div = eo+"_sub", eo+"_div"
-i = next((i for i,n in enumerate(g.node) if hi in n.input), len(g.node))
+i = next((i for i,n in enumerate(g.node) if eo in n.input), len(g.node))
 n1 = helper.make_node("Sub", [eo, "mean"], [sub])
 n2 = helper.make_node("Div", [sub, "std"], [div])
 g.node.insert(i, n1)
@@ -101,15 +101,16 @@ def expose_tensor(model_path, out_path, tensor_name):
 def add_dbg(i, o):
     m = onnx.load(i)
     n = m.graph.node
-    hr = next((x.input[0] for x in reversed(n) if x.op_type=="Tanh"), n[-1].output[0])
-    outs = {y for x in n for y in x.output}
-    es = next((x for x in ("emb_stdized","emb_sub","emb_std","head_input") if x in outs), None)
+    sub = next((x.output[0] for x in n if x.op_type == "Sub" and x.output), None)
+    div = next((x.output[0] for x in n if x.op_type == "Div" and x.output), None)
+    pre = next((x.input[0] for x in reversed(n) if x.op_type == "Tanh" and x.input), None)
+    hr = pre or (n[-1].output[0] if n and n[-1].output else None)
     ex = {x.name for x in m.graph.output}
-    for x in (es, hr):
+    for x in (sub, div, hr):
         if x and x not in ex:
             m.graph.output.append(helper.make_tensor_value_info(x, TensorProto.FLOAT, None))
     onnx.save(m, o)
-    return es, hr
+    return sub, div, hr
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("--audio", default="test.wav")
@@ -144,9 +145,9 @@ def main():
     
     print("Diff max:", np.abs(py - mg).max())
     
-    es, hr = add_dbg(a.merged, a.debug_out)
+    sub, div, hr = add_dbg(a.merged, a.debug_out)
     dbg = run(a.debug_out, x)
-    print("Debug keys:", len(dbg), es, hr)
+    print("Debug keys:", len(dbg), sub, div, hr)
 if __name__ == "__main__": main()
 # @path: gen_head_calib.py
 import sys, glob, os, numpy as np, librosa, onnxruntime as ort
