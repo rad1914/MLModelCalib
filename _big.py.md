@@ -38,7 +38,7 @@ g.node.insert(i, n1)
 g.node.insert(i+1, n2)
 for n in g.node:
     if sub in n.output or div in n.output: continue
-    n.input[:] = [div if x == hi else x for x in n.input]
+    n.input[:] = [div if x == eo else x for x in n.input]
 if "--tanh" in a:
     o = g.output[0].name
     t = o+"_t"
