@@ -40,11 +40,15 @@ for n in g.node:
     if sub in n.output or div in n.output: continue
     n.input[:] = [div if x == eo else x for x in n.input]
 if "--tanh" in a:
-    o = g.output[0].name
-    t = o+"_t"
+    m_inf = onnx.shape_inference.infer_shapes(m)
+    out_vi = next(
+        (ov for ov in m_inf.graph.output if dims(ov) and dims(ov)[-1] == 2),
+        g.output[-1],
+    )
+    o = out_vi.name
+    t = o + "_t"
     g.node.append(helper.make_node("Tanh", [o], [t]))
-    g.output[0].name = t
-    for v in g.value_info:
-        if v.name == o: v.name = t
+    target = next(x for x in g.output if x.name == o)
+    target.name = t
 g.ClearField("value_info")
 onnx.save(m, a[5])

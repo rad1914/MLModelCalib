@@ -40,12 +40,16 @@ for n in g.node:
     if sub in n.output or div in n.output: continue
     n.input[:] = [div if x == eo else x for x in n.input]
 if "--tanh" in a:
-    o = g.output[0].name
-    t = o+"_t"
+    m_inf = onnx.shape_inference.infer_shapes(m)
+    out_vi = next(
+        (ov for ov in m_inf.graph.output if dims(ov) and dims(ov)[-1] == 2),
+        g.output[-1],
+    )
+    o = out_vi.name
+    t = o + "_t"
     g.node.append(helper.make_node("Tanh", [o], [t]))
-    g.output[0].name = t
-    for v in g.value_info:
-        if v.name == o: v.name = t
+    target = next(x for x in g.output if x.name == o)
+    target.name = t
 g.ClearField("value_info")
 onnx.save(m, a[5])
 #!/usr/bin/env python3
@@ -236,14 +240,14 @@ act={"raw":lambda x:x,"tanh":np.tanh,"sigmoid":lambda x:1/(1+np.exp(-x))}
 die=lambda p: os.path.exists(p) or sys.exit(f"Missing: {p}")
 load=lambda p:(np.load(p) if p.endswith('.npy') else np.fromfile(p,np.float32)).astype(np.float32)
 def wav(p,sr):
-die(p); y,s=sf.read(p,dtype='float32')
-return librosa.resample(y.mean(1) if y.ndim>1 else y,s,sr) if s!=sr else y
+    die(p); y,s=sf.read(p,dtype='float32')
+    return librosa.resample(y.mean(1) if y.ndim>1 else y,orig_sr=s,target_sr=sr) if s!=sr else y
 def mel(y,sr,f):
-m=librosa.power_to_db(librosa.feature.melspectrogram(y=y,sr=sr,n_fft=N_FFT,hop_length=HOP,n_mels=N_MELS),ref=np.max).T.astype(np.float32)
-return m[:f] if len(m)>=f else np.vstack([m,np.full((f-len(m),N_MELS),m.min() if len(m) else -80,np.float32)])
+    m=librosa.power_to_db(librosa.feature.melspectrogram(y=y,sr=sr,n_fft=N_FFT,hop_length=HOP,n_mels=N_MELS),ref=np.max).T.astype(np.float32)
+    return m[:f] if len(m)>=f else np.vstack([m,np.full((f-len(m),N_MELS),m.min() if len(m) else -80,np.float32)])
 def run(s,x):
-i=s.get_inputs()[0]
-return s.run(None,{i.name:(x.T[None] if len(i.shape)>=3 and i.shape[2]==x.shape[0] else x[None]).astype(np.float32)})[0]
+    i=s.get_inputs()[0]
+    return s.run(None,{i.name:(x.T[None] if len(i.shape)>=3 and i.shape[2]==x.shape[0] else x[None]).astype(np.float32)})[0]
 p=argparse.ArgumentParser()
 [p.add_argument(f"--{k}",required=True) for k in("audio","encoder","head","mean","std")]
 p.add_argument("--sr",type=int,default=SR); p.add_argument("--frames",type=int,default=FRAMES)
@@ -258,8 +262,8 @@ if mean.size==1: mean=np.full_like(emb,mean.item())
 if std.size==1: std=np.full_like(emb,std.item())
 if mean.size!=emb.size or std.size!=emb.size: sys.exit("mean/std size mismatch")
 emb=(emb-mean)/(std+1e-12)
-out=run(ort.InferenceSession(a.head,providers=["CPUExecutionProvider"]),emb.reshape(1,-1))
-print(json.dumps({"output":act(out)[0].tolist()}))
+out=run(ort.InferenceSession(a.head,providers=["CPUExecutionProvider"]),emb)
+print(json.dumps({"output":act[a.activation](out)[0].tolist()}))
 #!/usr/bin/env python3
 # @path: quantize_model.py
 import sys, onnx
